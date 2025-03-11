@@ -13,15 +13,72 @@ import (
 )
 
 // For testing purposes
-var createS3Client = func(ctx context.Context) (lib.S3Client, error) {
-	return nil, fmt.Errorf("S3 client creation not implemented")
-}
+var (
+	createS3Client = func(ctx context.Context) (lib.S3Client, error) {
+		return nil, fmt.Errorf("S3 client creation not implemented")
+	}
+)
 
 const (
 	defaultConfigFile = ".sonic.yml"
 	defaultRegistry   = "public.ecr.aws"
 	defaultRunner     = "public.ecr.aws/docker/library/alpine:latest" // AWS ECR public registry
 	defaultAuditStore = "file"                                        // Default to file-based audit logging
+)
+
+// defaultCreateAuditStore creates the appropriate audit store based on configuration
+func defaultCreateAuditStore(config *Config, flags *cli.Context) (lib.AuditStore, error) {
+	// CLI flags take precedence over config file
+	storeType := flags.String("audit-store")
+	if storeType == "" {
+		storeType = config.Audit.Store
+	}
+	if storeType == "" {
+		storeType = defaultAuditStore
+	}
+
+	switch storeType {
+	case "file":
+		path := flags.String("audit-path")
+		if path == "" {
+			path = config.Audit.Path
+		}
+		if path == "" {
+			path = ".logs"
+		}
+		return lib.NewFileStore(path), nil
+
+	case "s3":
+		bucket := flags.String("audit-s3-bucket")
+		if bucket == "" {
+			bucket = config.Audit.S3Bucket
+		}
+		if bucket == "" {
+			return nil, fmt.Errorf("s3 bucket must be specified for s3 audit store")
+		}
+
+		prefix := flags.String("audit-path")
+		if prefix == "" {
+			prefix = config.Audit.Path
+		}
+
+		// Get S3 client
+		client, err := createS3Client(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("creating S3 client: %w", err)
+		}
+		return lib.NewS3Store(client, bucket, prefix), nil
+
+	default:
+		return nil, fmt.Errorf("unknown audit store type: %s", storeType)
+	}
+}
+
+// Variables that can be overridden in tests
+var (
+	createAuditStore = defaultCreateAuditStore
+	getGitRevision   = lib.GetGitRevision
+	execDocker       = lib.ExecDocker
 )
 
 type Config struct {
@@ -146,52 +203,39 @@ func loadConfig(path string, vars execVars) (*Config, error) {
 	return &config, nil
 }
 
-// createAuditStore creates the appropriate audit store based on configuration
-func createAuditStore(config *Config, flags *cli.Context) (lib.AuditStore, error) {
-	// CLI flags take precedence over config file
-	storeType := flags.String("audit-store")
-	if storeType == "" {
-		storeType = config.Audit.Store
-	}
-	if storeType == "" {
-		storeType = defaultAuditStore
+// VerifyRequirements checks if all required stages have been executed successfully
+func verifyRequirements(stage Stage, auditStore lib.AuditStore, projectName, gitRevision string) error {
+	if len(stage.Requires) == 0 {
+		return nil
 	}
 
-	switch storeType {
-	case "file":
-		path := flags.String("audit-path")
-		if path == "" {
-			path = config.Audit.Path
-		}
-		if path == "" {
-			path = ".logs"
-		}
-		return lib.NewFileStore(path), nil
-
-	case "s3":
-		bucket := flags.String("audit-s3-bucket")
-		if bucket == "" {
-			bucket = config.Audit.S3Bucket
-		}
-		if bucket == "" {
-			return nil, fmt.Errorf("s3 bucket must be specified for s3 audit store")
-		}
-
-		prefix := flags.String("audit-path")
-		if prefix == "" {
-			prefix = config.Audit.Path
-		}
-
-		// Get S3 client
-		client, err := createS3Client(context.Background())
-		if err != nil {
-			return nil, fmt.Errorf("creating S3 client: %w", err)
-		}
-		return lib.NewS3Store(client, bucket, prefix), nil
-
-	default:
-		return nil, fmt.Errorf("unknown audit store type: %s", storeType)
+	// Load audit logs for this project and revision
+	logs, err := auditStore.LoadLogs(projectName, gitRevision)
+	if err != nil {
+		return fmt.Errorf("loading audit logs: %w", err)
 	}
+
+	// Create a map of successful stages
+	successful := make(map[string]bool)
+	for _, log := range logs {
+		if log.Status == "success" {
+			successful[log.Stage] = true
+		}
+	}
+
+	// Check each required stage
+	var missing []string
+	for _, req := range stage.Requires {
+		if !successful[req] {
+			missing = append(missing, req)
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("required stages not completed successfully: %s", strings.Join(missing, ", "))
+	}
+
+	return nil
 }
 
 func createStageCommand(name string, stage Stage, config *Config) *cli.Command {
@@ -217,11 +261,21 @@ func createStageCommand(name string, stage Stage, config *Config) *cli.Command {
 		Usage:       fmt.Sprintf("Run the %s stage", name),
 		Description: fmt.Sprintf("Run the %s stage using %s runner", name, stage.Runner),
 		Action: func(ctx *cli.Context) error {
-			// Create audit store based on configuration
-			store, err := createAuditStore(config, ctx)
+			// Create audit store
+			auditStore, err := createAuditStore(config, ctx)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating audit store: %v\n", err)
-				// Continue execution even if audit logging fails
+				return fmt.Errorf("creating audit store: %w", err)
+			}
+
+			// Get git revision
+			gitRev, err := getGitRevision()
+			if err != nil {
+				gitRev = "unknown" // Don't fail if we can't get git revision
+			}
+
+			// Verify requirements before executing
+			if err := verifyRequirements(stage, auditStore, config.Project.Name, gitRev); err != nil {
+				return fmt.Errorf("stage requirements not met: %w", err)
 			}
 
 			// Create stage execution configuration
@@ -234,7 +288,7 @@ func createStageCommand(name string, stage Stage, config *Config) *cli.Command {
 			}
 
 			// Execute the stage
-			return lib.ExecuteStage(stageExec, store, config.Project.Name)
+			return lib.ExecuteStage(stageExec, auditStore, config.Project.Name)
 		},
 	}
 }

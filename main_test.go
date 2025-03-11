@@ -15,8 +15,23 @@ import (
 	"flag"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/urfave/cli/v2"
 )
+
+type MockAuditStore struct {
+	mock.Mock
+}
+
+func (m *MockAuditStore) Store(log lib.AuditLog) error {
+	args := m.Called(log)
+	return args.Error(0)
+}
+
+func (m *MockAuditStore) LoadLogs(project, gitRevision string) ([]lib.AuditLog, error) {
+	args := m.Called(project, gitRevision)
+	return args.Get(0).([]lib.AuditLog), args.Error(1)
+}
 
 func TestLoadConfig(t *testing.T) {
 	// Create a temporary config file

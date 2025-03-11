@@ -13,6 +13,8 @@ stages:
       CGO_ENABLED: "0"
   build:
     runner: "docker/library/golang:1.20-alpine3.17"
+    requires:
+      - test
     commands:
       - "CGO_ENABLED=0 go build -o bin/hello-world"
     environment:
@@ -20,6 +22,9 @@ stages:
       CGO_ENABLED: "0"
   execute:
     runner: "docker/library/golang:1.20-alpine3.17"
+    requires:
+      - test
+      - build
     commands:
       - "./bin/hello-world"
     volumes:

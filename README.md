@@ -64,15 +64,11 @@ project:
     s3bucket: ""         # S3 bucket name if using S3
 stages:
   test:
-    runner: "golang:1.22"
+    runner: "docker/library/golang:1.24.1-alpine"
     commands:
       - "go test ./..."
-    volumes:
-      - type: bind
-        source: "."
-        target: "/workspace"
   build:
-    runner: "golang:1.22"
+    runner: "docker/library/golang:1.24.1-alpine"
     commands:
       - "go build -o app"
 ```
@@ -113,9 +109,52 @@ Each stage can define:
 - `commands`: List of commands to execute
 - `volumes`: List of volume mounts
 - `environment`: Map of environment variables
-- `strategy`: Execution strategy (sequential/parallel)
-- `requires`: List of stages that must complete first
+- `requires`: List of stages that must complete successfully before this stage can run
 - `timeout`: Maximum execution time
+
+Example with stage dependencies:
+
+```yaml
+stages:
+  test:
+    runner: "golang:1.22"
+    commands:
+      - "go test ./..."
+  
+  build:
+    runner: "golang:1.22"
+    requires: ["test"]  # Build only runs if tests pass
+    commands:
+      - "go build -o app"
+  
+  deploy:
+    runner: "kubernetes"
+    requires: ["build", "test"]  # Deploy requires both build and test to pass
+    commands:
+      - "kubectl apply -f k8s/"
+```
+
+When running a stage with dependencies:
+- gosonic verifies if all required stages have completed successfully
+- Required stages must be run before the dependent stage
+- Dependencies are verified using the audit logs from previous runs
+
+Example execution:
+```bash
+# This will fail because 'test' hasn't run yet
+gosonic run build
+
+# This will work - run test first, then build
+gosonic run test  build
+
+# This will fail because build hasn't run yet
+gosonic run deploy
+
+# This will work - run all stages in the correct order
+gosonic run test build deploy
+```
+
+Note: gosonic does not automatically run required stages. You must explicitly run stages in the correct order.
 
 ### Volume Mounts
 

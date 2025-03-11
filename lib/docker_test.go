@@ -269,6 +269,25 @@ func TestParseImageRef_UnitTests(t *testing.T) {
 	}
 }
 
+type mockAuditStore struct {
+	logs []AuditLog
+}
+
+func (m *mockAuditStore) Store(log AuditLog) error {
+	m.logs = append(m.logs, log)
+	return nil
+}
+
+func (m *mockAuditStore) LoadLogs(project, gitRevision string) ([]AuditLog, error) {
+	var result []AuditLog
+	for _, log := range m.logs {
+		if log.Project == project && log.GitRevision == gitRevision {
+			result = append(result, log)
+		}
+	}
+	return result, nil
+}
+
 func TestExecuteStage(t *testing.T) {
 	tests := map[string]struct {
 		stage       StageExecution
@@ -400,4 +419,10 @@ func TestExecuteStage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Add LoadLogs method to MockAuditStore
+func (m *MockAuditStore) LoadLogs(project, gitRevision string) ([]AuditLog, error) {
+	args := m.Called(project, gitRevision)
+	return args.Get(0).([]AuditLog), args.Error(1)
 }
