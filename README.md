@@ -114,23 +114,25 @@ project:
     path: ".logs"
 stages:
   test:
-    runner: "golang:1.22"
-    commands: ["go test ./..."]
+    runner: "docker/library/golang:1.20-alpine3.17"
+    commands: 
+      - "go test ./..."
   build:
-    runner: "golang:1.22"
+    runner: "docker/library/golang:1.20-alpine3.17"
     requires: ["test"]  # Build requires test to pass
-    commands: ["go build"]
+    commands: 
+      - "go build"
   deploy:
-    runner: "alpine"
     requires: ["build", "test"]  # Deploy requires both
-    commands: ["./deploy.sh"]
+    commands: 
+      - "./deploy.sh"
 ```
 
 ### Stages
 
 Each stage can define:
 
-- `runner`: Docker image to use (e.g., "golang:1.22")
+- `runner`: Docker image to use (e.g., "docker/library/golang:1.20-alpine3.17")
 - `commands`: List of commands to execute
 - `volumes`: List of volume mounts
 - `environment`: Map of environment variables
@@ -142,12 +144,12 @@ Example with stage dependencies:
 ```yaml
 stages:
   test:
-    runner: "golang:1.22"
+    runner: "docker/library/golang:1.20-alpine3.17"
     commands:
       - "go test ./..."
   
   build:
-    runner: "golang:1.22"
+    runner: "docker/library/golang:1.20-alpine3.17"
     requires: ["test"]  # Build only runs if tests pass
     commands:
       - "go build -o app"
@@ -197,7 +199,7 @@ Example with minimal configuration:
 ```yaml
 stages:
   test:
-    runner: "golang:1.22"
+    runner: "docker/library/golang:1.20-alpine3.17"
     commands:
       - "go test ./..."    # Will run in /workspace
 ```
@@ -206,7 +208,7 @@ Example overriding the default:
 ```yaml
 stages:
   test:
-    runner: "golang:1.22"
+    runner: "docker/library/golang:1.20-alpine3.17"
     commands:
       - "go test ./..."
     volumes:
@@ -219,21 +221,6 @@ stages:
 
 The `runner` field in a stage specifies which Docker image to use for execution. The runner can be configured in several ways:
 
-```yaml
-stages:
-  # Full image reference
-  test:
-    runner: "docker.io/library/golang:1.22"
-  
-  # Short form (uses Docker Hub)
-  build:
-    runner: "golang:1.22"
-  
-  # AWS ECR public registry
-  deploy:
-    runner: "public.ecr.aws/docker/library/alpine:latest"
-```
-
 Runner resolution follows these rules:
 
 Default values:
@@ -242,44 +229,19 @@ Default values:
 
 1. If a full image reference is provided (contains domain), it's used as-is:
    ```yaml
-   runner: "docker.io/library/golang:1.22"
+   runner: "docker.io/library/docker/library/golang:1.20-alpine3.17"
    ```
 
 2. If only image name is provided, the default registry is prepended:
    ```yaml
-   runner: "golang:1.22"
-   # Resolves to: "public.ecr.aws/golang:1.22"
+   runner: "docker/library/golang:1.20-alpine3.17"
+   # Resolves to: "public.ecr.aws/docker/library/golang:1.20-alpine3.17"
    ```
 
 3. If no runner is specified, the default runner is used:
    ```yaml
    # Resolves to: "public.ecr.aws/docker/library/alpine:latest"
    ```
-
-Example configurations:
-
-```yaml
-stages:
-  # Uses default registry
-  test:
-    runner: "golang:1.22"
-    # Resolves to: "public.ecr.aws/docker/library/golang:1.22"
-  
-  # Full reference, bypasses defaults
-  build:
-    runner: "docker.io/library/golang:1.22"
-    # Used as-is: "docker.io/library/golang:1.22"
-  
-  # No tag specified
-  lint:
-    runner: "golangci/golangci-lint"
-    # Resolves to: "public.ecr.aws/golangci/golangci-lint:latest"
-  
-  # AWS ECR public registry
-  deploy:
-    runner: "public.ecr.aws/docker/library/alpine:3.18"
-    # Used as-is: "public.ecr.aws/docker/library/alpine:3.18"
-```
 
 The runner image is used to create a container with:
 - Current directory mounted at `/workspace` (unless overridden)
