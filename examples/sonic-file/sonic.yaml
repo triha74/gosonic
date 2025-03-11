@@ -1,0 +1,93 @@
+version: "1"
+project:
+  name: "test-project"
+  language: "go"
+  root: "."
+stages:
+  unit-test:
+    runner:  "docker/library/golang:1.24.1-alpine"
+    commands:
+      - "go test ./..."
+    volumes:
+      - type: bind
+        source: "."
+        target: "/workspace"
+      - type: cache
+        source: "go-cache"
+        target: "/root/.cache/go-build"
+    environment:
+      GO111MODULE: "on"
+      TEST_MODE: "unit"
+  build:
+    runner:  "docker/library/golang:1.24.1-alpine"
+    commands:
+      - "go build ./..."
+    volumes:
+      - type: bind
+        source: "."
+        target: "/workspace"
+    environment:
+      GO111MODULE: "on"
+      CGO_ENABLED: "0"
+  integration-test:
+    runner: "docker/library/golang:1.24.1-alpine"
+    commands:
+      - "go test -tags=integration ./..."
+    volumes:
+      - type: bind
+        source: "."
+        target: "/workspace"
+      - type: bind
+        source: "./testdata"
+        target: "/testdata"
+    environment:
+      TEST_MODE: "integration"
+      DB_HOST: "localhost"
+  package:
+    runner: "docker"
+    commands:
+      - "docker build ."
+    volumes:
+      - type: bind
+        source: "."
+        target: "/workspace"
+      - type: bind
+        source: "/var/run/docker.sock"
+        target: "/var/run/docker.sock"
+  publish:
+    runner: "docker"
+    commands:
+      - "docker push"
+    volumes:
+      - type: bind
+        source: "/var/run/docker.sock"
+        target: "/var/run/docker.sock"
+      - type: bind
+        source: "${HOME}/.docker/config.json"
+        target: "/root/.docker/config.json"
+        readonly: true
+    environment:
+      DOCKER_CONFIG: "/root/.docker"
+  deploy:
+    runner: "kubernetes"
+    commands:
+      - "kubectl apply -f"
+    volumes:
+      - type: bind
+        source: "${HOME}/.kube/${region.name}/config"
+        target: "/root/.kube/config"
+        readonly: true
+      - type: bind
+        source: "./k8s"
+        target: "/workspace/k8s"
+    environment:
+      KUBECONFIG: "/root/.kube/config"
+      REGION: "${region.name}"
+  clean:
+    runner: "shell"
+    commands:
+      - "rm -rf ./bin"
+    volumes:
+      - type: bind
+        source: "."
+        target: "/workspace"
