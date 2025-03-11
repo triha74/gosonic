@@ -1,0 +1,28 @@
+version: "1"
+project:
+  name: "hello-world"
+  language: "go"
+  root: "."
+stages:
+  test:
+    runner: "docker/library/golang:1.20-alpine3.17"
+    commands:
+      - "go test -v ./..."
+    environment:
+      GO111MODULE: "on"
+      CGO_ENABLED: "0"
+  build:
+    runner: "docker/library/golang:1.20-alpine3.17"
+    commands:
+      - "CGO_ENABLED=0 go build -o bin/hello-world"
+    environment:
+      GO111MODULE: "on"
+      CGO_ENABLED: "0"
+  execute:
+    runner: "docker/library/golang:1.20-alpine3.17"
+    commands:
+      - "./bin/hello-world"
+    volumes:
+      - type: bind
+        source: "./bin"
+        target: "/workspace/bin"
