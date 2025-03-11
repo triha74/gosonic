@@ -45,7 +45,7 @@ The build script will:
 ### Using go install
 
 ```bash
-go install github.com/yourusername/go-sonic@latest
+go install github.com/triha74/go-sonic@latest
 ```
 
 ## Quick Start
