@@ -22,8 +22,8 @@ var (
 const (
 	defaultConfigFile = ".sonic.yml"
 	defaultRegistry   = "public.ecr.aws"
-	defaultRunner     = "public.ecr.aws/docker/library/alpine:latest" // AWS ECR public registry
-	defaultAuditStore = "file"                                        // Default to file-based audit logging
+	defaultRunner     = "public.ecr.aws/docker/library/alpine:latest"
+	defaultAuditStore = "file"
 )
 
 // defaultCreateAuditStore creates the appropriate audit store based on configuration
@@ -328,6 +328,12 @@ func run(args []string) error {
 			Name:    "audit-s3-bucket",
 			Usage:   "S3 bucket name for audit logs when using s3 store",
 			EnvVars: []string{"SONIC_AUDIT_S3_BUCKET"},
+		},
+		&cli.StringFlag{
+			Name:    "registry",
+			Usage:   "Default Docker registry to use when not specified in image reference",
+			Value:   defaultRegistry,
+			EnvVars: []string{"GOSONIC_DEFAULT_REGISTRY"},
 		},
 	}
 

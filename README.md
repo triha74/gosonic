@@ -190,6 +190,81 @@ stages:
         target: "/app"    # Use different workspace
 ```
 
+### Runner Configuration
+
+The `runner` field in a stage specifies which Docker image to use for execution. The runner can be configured in several ways:
+
+```yaml
+stages:
+  # Full image reference
+  test:
+    runner: "docker.io/library/golang:1.22"
+  
+  # Short form (uses Docker Hub)
+  build:
+    runner: "golang:1.22"
+  
+  # AWS ECR public registry
+  deploy:
+    runner: "public.ecr.aws/docker/library/alpine:latest"
+```
+
+Runner resolution follows these rules:
+
+Default values:
+- Default registry: `public.ecr.aws` (hardcoded, cannot be changed via flags)
+- Default runner: `public.ecr.aws/docker/library/alpine:latest`
+
+1. If a full image reference is provided (contains domain), it's used as-is:
+   ```yaml
+   runner: "docker.io/library/golang:1.22"
+   ```
+
+2. If only image name is provided, the default registry is prepended:
+   ```yaml
+   runner: "golang:1.22"
+   # Resolves to: "public.ecr.aws/golang:1.22"
+   ```
+
+3. If no runner is specified, the default runner is used:
+   ```yaml
+   # Resolves to: "public.ecr.aws/docker/library/alpine:latest"
+   ```
+
+Example configurations:
+
+```yaml
+stages:
+  # Uses default registry
+  test:
+    runner: "golang:1.22"
+    # Resolves to: "public.ecr.aws/docker/library/golang:1.22"
+  
+  # Full reference, bypasses defaults
+  build:
+    runner: "docker.io/library/golang:1.22"
+    # Used as-is: "docker.io/library/golang:1.22"
+  
+  # No tag specified
+  lint:
+    runner: "golangci/golangci-lint"
+    # Resolves to: "public.ecr.aws/golangci/golangci-lint:latest"
+  
+  # AWS ECR public registry
+  deploy:
+    runner: "public.ecr.aws/docker/library/alpine:3.18"
+    # Used as-is: "public.ecr.aws/docker/library/alpine:3.18"
+```
+
+The runner image is used to create a container with:
+- Current directory mounted at `/workspace` (unless overridden)
+- Working directory set to `/workspace`
+- Commands executed using `sh -c`
+- Container removed after execution (`--rm`)
+- Init process enabled (`--init`)
+
+You can override these defaults using the `volumes` and other configuration options in the stage definition.
+
 ## Command Line Interface
 
 ```
@@ -200,9 +275,45 @@ COMMANDS:
    help     Show help
    
 GLOBAL OPTIONS:
-   --sonic-file value, -f value  Path to sonic configuration file (default: ".sonic.yml")
-   --var value, -v value        Execution variables in key=value format (can be specified multiple times)
-   --help, -h                    Show help
+   --sonic-file value, -f value    Path to sonic configuration file (default: ".sonic.yml")
+                                   Environment: SONIC_CONFIG_FILE
+   
+   --var value, -v value           Execution variables in key=value format (can be specified multiple times)
+                                   Environment: SONIC_VARS
+   
+   --audit-store value             Audit log storage type (file or s3)
+                                   Environment: SONIC_AUDIT_STORE
+   
+   --audit-path value              Path for audit logs (directory for file store, prefix for S3)
+                                   Environment: SONIC_AUDIT_PATH
+   
+   --audit-s3-bucket value         S3 bucket name for audit logs when using s3 store
+                                   Environment: SONIC_AUDIT_S3_BUCKET
+   
+   --registry value                Default Docker registry to use when not specified in image reference
+                                   Default: "public.ecr.aws"
+                                   Environment: GOSONIC_DEFAULT_REGISTRY
+   
+   --help, -h                      Show help
+```
+
+### Environment Variables
+
+All command line flags can also be set using environment variables:
+
+- `SONIC_CONFIG_FILE`: Path to configuration file
+- `SONIC_VARS`: Comma-separated list of key=value pairs
+- `SONIC_AUDIT_STORE`: Audit log storage type
+- `SONIC_AUDIT_PATH`: Path for audit logs
+- `SONIC_AUDIT_S3_BUCKET`: S3 bucket for audit logs
+- `GOSONIC_DEFAULT_REGISTRY`: Default Docker registry
+
+Example using environment variables:
+```bash
+export SONIC_AUDIT_STORE=s3
+export SONIC_AUDIT_S3_BUCKET=my-audit-logs
+export SONIC_AUDIT_PATH=ci-logs/
+gosonic run build
 ```
 
 ## Execution Variables
@@ -294,3 +405,39 @@ go test -v ./...
 ## License
 
 MIT License - see LICENSE file for details
+
+### Project Configuration
+
+The `project` section in the configuration defines the basic properties of your project:
+
+```yaml
+project:
+  name: string        # Required. Name of your project
+  language: string    # Optional. Programming language (e.g., "go", "python")
+  root: string       # Optional. Project root directory, defaults to "."
+```
+
+Example configurations:
+
+```yaml
+# Minimal configuration
+project:
+  name: "my-service"
+
+# Full configuration
+project:
+  name: "hello-world"
+  language: "go"
+  root: "."
+
+# Custom root directory
+project:
+  name: "web-app"
+  language: "javascript"
+  root: "./src"
+```
+
+The project properties are used for:
+- `name`: Used in audit logs and error messages
+- `language`: Currently informational only
+- `root`: Base directory for relative paths in volume mounts
