@@ -99,6 +99,31 @@ stages:
     commands: []     # Commands to execute
     volumes: []      # Volume mounts
     environment: {}  # Environment variables
+    requires: []     # List of stages that must complete successfully first
+```
+
+Example:
+```yaml
+version: "1"
+project:
+  name: "my-service"
+  language: "go"
+  root: "."
+  audit:
+    store: "file"
+    path: ".logs"
+stages:
+  test:
+    runner: "golang:1.22"
+    commands: ["go test ./..."]
+  build:
+    runner: "golang:1.22"
+    requires: ["test"]  # Build requires test to pass
+    commands: ["go build"]
+  deploy:
+    runner: "alpine"
+    requires: ["build", "test"]  # Deploy requires both
+    commands: ["./deploy.sh"]
 ```
 
 ### Stages
