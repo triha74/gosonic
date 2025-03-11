@@ -1,10 +1,11 @@
-# go-sonic
+# gosonic
 
-A modern, Docker-based CI/CD pipeline tool written in Go.
+A modern, fully portable, Docker-based CI/CD task execution tool written in Go.
 
 ## Overview
 
-go-sonic provides a unified way to build, test, package and deploy applications using Docker containers. It uses a simple YAML configuration file to define stages and their execution environments.
+gosonic provides a unified way to build, test, package and deploy applications using Docker containers. It uses a simple YAML configuration file to define stages and their execution environments. gosonic is not a CI/CD pipeline tool, it is a task execution tool, which means that its used within a CI/CD pipeline task to execute a set of commands. So while its similar to tools like Github Actions in its configuration, it is not ment as a replacement for a CI/CD pipeline tool but rather as a replacement for tools like `make` or `Makefile` to execute a set of commands.
+
 
 ## Features
 
@@ -27,8 +28,8 @@ Requirements:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/go-sonic.git
-cd go-sonic
+git clone https://github.com/triha/gosonic.git
+cd gosonic
 
 # Build and install
 ./build.sh
@@ -177,8 +178,9 @@ gosonic run test  build
 # This will fail because build hasn't run yet
 gosonic run deploy
 
-# This will work - run all stages in the correct order
-gosonic run test build deploy
+# This will work - run all stages in the correct order. Evalaution uses audit logs to determine if the stage has completed successfully.
+gosonic run test 
+gosonic build deploy
 ```
 
 Note: gosonic does not automatically run required stages. You must explicitly run stages in the correct order.
@@ -341,13 +343,82 @@ stages:
 
 ## Audit Logging
 
-go-sonic automatically logs all stage executions to JSON files in the `logs` directory. Each log includes:
-
+go-sonic automatically audit logs all stage executions. Each log includes:
 - Project and stage information
 - Git revision
 - Command executed
 - Start time and duration
 - Execution status and any errors
+
+### Configuration
+
+Audit logging can be configured in two ways:
+
+1. In the configuration file:
+```yaml
+project:
+  name: "my-service"
+audit:
+  store: "file"        # "file" or "s3"
+  path: ".logs"        # Directory for file store or S3 prefix
+  s3bucket: ""         # S3 bucket name if using S3 store
+```
+
+2. Using command line flags or environment variables:
+```bash
+# Using flags
+gosonic run build --audit-store=file --audit-path=.logs
+
+# Using environment variables
+export SONIC_AUDIT_STORE=s3
+export SONIC_AUDIT_S3_BUCKET=my-audit-logs
+export SONIC_AUDIT_PATH=ci-logs/
+```
+
+### Storage Options
+
+#### File Store (Default)
+- Type: `file`
+- Stores logs as JSON files in a local directory
+- Default directory: `.logs`
+- Configure path using:
+  - Config: `audit.path`
+  - Flag: `--audit-path`
+  - Environment: `SONIC_AUDIT_PATH`
+
+Example file store configuration:
+```yaml
+audit:
+  store: "file"
+  path: ".logs"
+```
+
+#### S3 Store
+- Type: `s3`
+- Stores logs as JSON files in an S3 bucket
+- Requires:
+  - S3 bucket name
+  - Optional prefix for organizing logs
+- Configure using:
+  - Config: `audit.s3bucket` and `audit.path`
+  - Flags: `--audit-s3-bucket` and `--audit-path`
+  - Environment: `SONIC_AUDIT_S3_BUCKET` and `SONIC_AUDIT_PATH`
+
+Example S3 configuration:
+```yaml
+audit:
+  store: "s3"
+  s3bucket: "my-audit-logs"
+  path: "ci-logs/"
+```
+
+### Configuration Priority
+
+The audit store configuration is resolved in this order:
+1. Command line flags
+2. Environment variables
+3. Configuration file
+4. Defaults (file store in `.logs` directory)
 
 ## Development
 
