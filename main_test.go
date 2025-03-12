@@ -186,16 +186,7 @@ stages:
 }
 
 func TestStageExecution(t *testing.T) {
-	// Set GO_TEST environment variable
-	oldGoTest := os.Getenv("GO_TEST")
-	os.Setenv("GO_TEST", "1")
-	defer func() { os.Setenv("GO_TEST", oldGoTest) }()
-
-	// Store original docker execution function
-	originalDockerExec := lib.ExecDocker
-	defer func() { lib.ExecDocker = originalDockerExec }()
-
-	// Create a test config file
+	// Create a temporary config file
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "test-sonic.yml")
 
@@ -233,17 +224,29 @@ stages:
 	lib.ExecDocker = func(args []string) lib.DockerResult {
 		// Find which command is being executed
 		var cmdType string
-		for i, arg := range args {
-			if arg == "sh" && i+2 < len(args) && args[i+1] == "-c" {
-				switch {
-				case strings.Contains(args[i+2], "go test"):
-					cmdType = "unit-test"
-				case strings.Contains(args[i+2], "go build"):
-					cmdType = "build"
-				case strings.Contains(args[i+2], "kubectl"):
-					cmdType = "deploy"
+
+		// Check for direct command execution (no shell)
+		cmdStr := strings.Join(args, " ")
+		if strings.Contains(cmdStr, "go test") {
+			cmdType = "unit-test"
+		} else if strings.Contains(cmdStr, "go build") {
+			cmdType = "build"
+		} else if strings.Contains(cmdStr, "kubectl apply") {
+			cmdType = "deploy"
+		} else {
+			// Check for shell-wrapped commands
+			for i, arg := range args {
+				if arg == "sh" && i+2 < len(args) && args[i+1] == "-c" {
+					switch {
+					case strings.Contains(args[i+2], "go test"):
+						cmdType = "unit-test"
+					case strings.Contains(args[i+2], "go build"):
+						cmdType = "build"
+					case strings.Contains(args[i+2], "kubectl"):
+						cmdType = "deploy"
+					}
+					break
 				}
-				break
 			}
 		}
 
@@ -284,11 +287,13 @@ stages:
 		},
 	}
 
+	originalGoTest := os.Getenv("GO_TEST")
+
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			var stdout, stderr string
 			var err error
-
+			os.Setenv("GO_TEST", "1")
 			// Capture output and error
 			stdout, stderr, err = captureOutput(func() error {
 				return run(tc.args)
@@ -322,6 +327,8 @@ stages:
 				}
 			}
 		})
+
+		defer os.Setenv("GO_TEST", originalGoTest)
 	}
 }
 

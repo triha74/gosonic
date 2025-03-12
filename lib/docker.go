@@ -202,8 +202,12 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	dockerArgs = append(dockerArgs, stage.Runner)
 
 	// Add commands
-	if len(stage.Commands) > 0 {
-		// Join multiple commands with &&
+	if len(stage.Commands) == 1 {
+		// For a single command, execute directly without shell
+		args := splitCommandArgs(stage.Commands[0])
+		dockerArgs = append(dockerArgs, args...)
+	} else if len(stage.Commands) > 1 {
+		// For multiple commands, use shell
 		command := strings.Join(stage.Commands, " && ")
 		dockerArgs = append(dockerArgs, "sh", "-c", command)
 	}
@@ -256,4 +260,46 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	}
 
 	return nil
+}
+
+// splitCommandArgs splits a command string into arguments, respecting quotes
+func splitCommandArgs(cmd string) []string {
+	var args []string
+	var currentArg strings.Builder
+	inQuotes := false
+	quoteChar := rune(0)
+
+	for _, char := range cmd {
+		switch {
+		case char == '"' || char == '\'':
+			if inQuotes && char == quoteChar {
+				// End of quoted section
+				inQuotes = false
+				quoteChar = rune(0)
+			} else if !inQuotes {
+				// Start of quoted section
+				inQuotes = true
+				quoteChar = char
+			} else {
+				// Quote character inside another quote type
+				currentArg.WriteRune(char)
+			}
+		case char == ' ' && !inQuotes:
+			// Space outside quotes - end of argument
+			if currentArg.Len() > 0 {
+				args = append(args, currentArg.String())
+				currentArg.Reset()
+			}
+		default:
+			// Regular character
+			currentArg.WriteRune(char)
+		}
+	}
+
+	// Add the last argument if there is one
+	if currentArg.Len() > 0 {
+		args = append(args, currentArg.String())
+	}
+
+	return args
 }
