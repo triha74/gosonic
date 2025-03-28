@@ -2,6 +2,7 @@ package lib
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -159,6 +160,7 @@ type StageExecution struct {
 	Commands    []string
 	Environment map[string]string
 	Volumes     []Volume
+	Verbose     bool // Add verbose flag
 }
 
 // ExecuteStage runs a stage in a docker container and handles audit logging
@@ -182,6 +184,9 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	// Add environment variables
 	for k, v := range stage.Environment {
 		dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", k, v))
+		if val, exists := os.LookupEnv(v); exists {
+			dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", v, val))
+		}
 	}
 
 	// Add volume mounts
@@ -201,24 +206,33 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	// Add image name
 	dockerArgs = append(dockerArgs, stage.Runner)
 
-	// Add commands
+	// Add commands with variable substitution
 	if len(stage.Commands) == 1 {
 		// For a single command, execute directly without shell
-		args := splitCommandArgs(stage.Commands[0])
+		// First, substitute environment variables in the command
+		command := os.ExpandEnv(stage.Commands[0])
+		args := splitCommandArgs(command)
 		dockerArgs = append(dockerArgs, args...)
 	} else if len(stage.Commands) > 1 {
 		// For multiple commands, use shell
-		command := strings.Join(stage.Commands, " && ")
+		// Substitute environment variables in each command
+		expandedCommands := make([]string, len(stage.Commands))
+		for i, cmd := range stage.Commands {
+			expandedCommands[i] = os.ExpandEnv(cmd)
+		}
+		command := strings.Join(expandedCommands, " && ")
 		dockerArgs = append(dockerArgs, "sh", "-c", command)
 	}
 
 	// Create the full command string for audit
 	fullCommand := strings.Join(dockerArgs, " ")
 
-	// Print the command
-	fmt.Printf("Stage: %s\n", stage.Name)
-	fmt.Printf("Runner: %s\n", stage.Runner)
-	fmt.Printf("\nDocker command:\n%s\n", fullCommand)
+	// Print the command only if verbose is enabled
+	if stage.Verbose {
+		fmt.Printf("Stage: %s\n", stage.Name)
+		fmt.Printf("Runner: %s\n", stage.Runner)
+		fmt.Printf("\nDocker command:\n%s\n", fullCommand)
+	}
 
 	// Create audit log
 	auditLog := AuditLog{
@@ -233,6 +247,7 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	// Write initial audit log
 	if auditStore != nil {
 		if err := auditStore.Store(auditLog); err != nil {
+			// Always print audit log errors, even in non-verbose mode
 			fmt.Printf("Error writing audit log: %v\n", err)
 		}
 	}
@@ -240,7 +255,7 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	// Execute docker command
 	result := ExecDocker(dockerArgs)
 
-	// Print output
+	// Print output - always show command output regardless of verbose setting
 	if result.Stdout != "" {
 		fmt.Println(result.Stdout)
 	}

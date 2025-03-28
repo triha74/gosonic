@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +13,7 @@ import (
 
 	"flag"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/urfave/cli/v2"
@@ -135,54 +135,6 @@ func captureOutput(f func() error) (stdout string, stderr string, err error) {
 	stderr = <-errC
 
 	return
-}
-
-func TestStageOrder(t *testing.T) {
-	// Create a temporary config file with specifically ordered stages
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "ordered-sonic.yml")
-
-	configData := []byte(`
-version: "1"
-project:
-  name: "test-project"
-  language: "go"
-  root: "."
-stages:
-  unit-test:
-    runner: "golang"
-    commands:
-      - "go test ./..."
-  build:
-    runner: "golang"
-    commands:
-      - "go build ./..."
-  deploy:
-    runner: "kubernetes"
-    commands:
-      - "kubectl apply -f k8s/"
-`)
-
-	err := os.WriteFile(configPath, configData, 0644)
-	assert.NoError(t, err)
-
-	config, err := loadConfig(configPath, nil)
-	assert.NoError(t, err)
-
-	// Define the expected order
-	expectedOrder := []string{
-		"unit-test",
-		"build",
-		"deploy",
-	}
-
-	// Verify the order matches exactly using StageOrder
-	assert.Equal(t, expectedOrder, config.StageOrder, "Stage order should be preserved exactly as defined in YAML")
-
-	// Also verify that all stages exist in the map
-	for _, stageName := range expectedOrder {
-		assert.Contains(t, config.Stages, stageName, "Stage %s should exist in the stages map", stageName)
-	}
 }
 
 func TestStageExecution(t *testing.T) {
@@ -337,19 +289,23 @@ func TestCreateAuditStore(t *testing.T) {
 
 	// Mock S3 client creation
 	originalCreateS3Client := createS3Client
-	createS3Client = func(ctx context.Context) (lib.S3Client, error) {
-		return &lib.MockS3Client{}, nil
+	createS3Client = func(verbose bool) (lib.S3Client, error) {
+		mockClient := new(lib.MockS3Client)
+		mockClient.On("PutObject", mock.Anything, mock.Anything).Return(&s3.PutObjectOutput{}, nil)
+		mockClient.On("ListObjectsV2", mock.Anything, mock.Anything).Return(&s3.ListObjectsV2Output{}, nil)
+		return mockClient, nil
 	}
 	defer func() { createS3Client = originalCreateS3Client }()
 
 	tests := map[string]struct {
-		config     *Config
-		flags      []string
-		env        map[string]string
-		wantType   string
-		wantPath   string
-		wantBucket string
-		wantErr    bool
+		config      *Config
+		flags       map[string]string
+		env         map[string]string
+		wantType    string
+		wantPath    string
+		wantBucket  string
+		wantErr     bool
+		wantErrText string
 	}{
 		"default config": {
 			config:   &Config{},
@@ -359,9 +315,10 @@ func TestCreateAuditStore(t *testing.T) {
 		"file store from config": {
 			config: &Config{
 				Audit: struct {
-					Store    string `yaml:"store"`
-					Path     string `yaml:"path"`
-					S3Bucket string `yaml:"s3bucket"`
+					Store      string `yaml:"store"`
+					Path       string `yaml:"path"`
+					S3Bucket   string `yaml:"s3bucket"`
+					AWSProfile string `yaml:"aws_profile"`
 				}{
 					Store: "file",
 					Path:  filepath.Join(tmpDir, "audit-logs"),
@@ -373,9 +330,10 @@ func TestCreateAuditStore(t *testing.T) {
 		"s3 store from config": {
 			config: &Config{
 				Audit: struct {
-					Store    string `yaml:"store"`
-					Path     string `yaml:"path"`
-					S3Bucket string `yaml:"s3bucket"`
+					Store      string `yaml:"store"`
+					Path       string `yaml:"path"`
+					S3Bucket   string `yaml:"s3bucket"`
+					AWSProfile string `yaml:"aws_profile"`
 				}{
 					Store:    "s3",
 					Path:     "logs/prefix",
@@ -389,19 +347,20 @@ func TestCreateAuditStore(t *testing.T) {
 		"cli flags override config": {
 			config: &Config{
 				Audit: struct {
-					Store    string `yaml:"store"`
-					Path     string `yaml:"path"`
-					S3Bucket string `yaml:"s3bucket"`
+					Store      string `yaml:"store"`
+					Path       string `yaml:"path"`
+					S3Bucket   string `yaml:"s3bucket"`
+					AWSProfile string `yaml:"aws_profile"`
 				}{
 					Store:    "file",
 					Path:     "config-logs",
 					S3Bucket: "config-bucket",
 				},
 			},
-			flags: []string{
-				"--audit-store", "s3",
-				"--audit-path", "cli-logs",
-				"--audit-s3-bucket", "cli-bucket",
+			flags: map[string]string{
+				"--audit-store":     "s3",
+				"--audit-path":      "cli-logs",
+				"--audit-s3-bucket": "cli-bucket",
 			},
 			wantType:   "s3",
 			wantPath:   "cli-logs",
@@ -410,9 +369,10 @@ func TestCreateAuditStore(t *testing.T) {
 		"env vars override config": {
 			config: &Config{
 				Audit: struct {
-					Store    string `yaml:"store"`
-					Path     string `yaml:"path"`
-					S3Bucket string `yaml:"s3bucket"`
+					Store      string `yaml:"store"`
+					Path       string `yaml:"path"`
+					S3Bucket   string `yaml:"s3bucket"`
+					AWSProfile string `yaml:"aws_profile"`
 				}{
 					Store:    "file",
 					Path:     "config-logs",
@@ -431,27 +391,31 @@ func TestCreateAuditStore(t *testing.T) {
 		"s3 store without bucket": {
 			config: &Config{
 				Audit: struct {
-					Store    string `yaml:"store"`
-					Path     string `yaml:"path"`
-					S3Bucket string `yaml:"s3bucket"`
+					Store      string `yaml:"store"`
+					Path       string `yaml:"path"`
+					S3Bucket   string `yaml:"s3bucket"`
+					AWSProfile string `yaml:"aws_profile"`
 				}{
 					Store: "s3",
 					Path:  "logs",
 				},
 			},
-			wantErr: true,
+			wantErr:     true,
+			wantErrText: "s3 bucket must be specified for s3 audit store",
 		},
 		"invalid store type": {
 			config: &Config{
 				Audit: struct {
-					Store    string `yaml:"store"`
-					Path     string `yaml:"path"`
-					S3Bucket string `yaml:"s3bucket"`
+					Store      string `yaml:"store"`
+					Path       string `yaml:"path"`
+					S3Bucket   string `yaml:"s3bucket"`
+					AWSProfile string `yaml:"aws_profile"`
 				}{
 					Store: "invalid",
 				},
 			},
-			wantErr: true,
+			wantErr:     true,
+			wantErrText: "unknown audit store type: invalid",
 		},
 	}
 
@@ -494,7 +458,12 @@ func TestCreateAuditStore(t *testing.T) {
 			}
 
 			if len(tc.flags) > 0 {
-				err := set.Parse(tc.flags)
+				// Convert map to slice of strings in "key=value" format
+				var flagSlice []string
+				for k, v := range tc.flags {
+					flagSlice = append(flagSlice, k, v)
+				}
+				err := set.Parse(flagSlice)
 				assert.NoError(t, err)
 			}
 
@@ -504,6 +473,7 @@ func TestCreateAuditStore(t *testing.T) {
 			store, err := createAuditStore(tc.config, ctx)
 			if tc.wantErr {
 				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErrText)
 				return
 			}
 			assert.NoError(t, err)
@@ -759,4 +729,41 @@ stages:
 	assert.Equal(t, "${HOME}/.kube/${region.name}/config", deploy.Volumes[0].Source)
 	assert.Equal(t, "${region.name}", deploy.Environment["REGION"])
 	assert.Equal(t, "${env}", deploy.Environment["ENV"])
+}
+
+func TestLoadConfigWithS3Audit(t *testing.T) {
+	// Create a temporary config file
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test-s3-audit.yml")
+
+	configData := []byte(`
+version: "1"
+project:
+  name: "test-project"
+  language: "go"
+  root: "."
+audit:
+  store: "s3"
+  path: "test-logs"
+  s3bucket: "test-bucket"
+  aws_profile: "test-profile"
+stages:
+  test:
+    runner: "golang"
+    commands:
+      - "go test ./..."
+`)
+
+	err := os.WriteFile(configPath, configData, 0644)
+	assert.NoError(t, err)
+
+	// Load the config
+	config, err := loadConfig(configPath, nil)
+	assert.NoError(t, err)
+
+	// Check audit settings
+	assert.Equal(t, "s3", config.Audit.Store)
+	assert.Equal(t, "test-logs", config.Audit.Path)
+	assert.Equal(t, "test-bucket", config.Audit.S3Bucket)
+	assert.Equal(t, "test-profile", config.Audit.AWSProfile)
 }

@@ -352,9 +352,3 @@ func TestExecuteStage(t *testing.T) {
 		})
 	}
 }
-
-// Add LoadLogs method to MockAuditStore
-func (m *MockAuditStore) LoadLogs(project, gitRevision string) ([]AuditLog, error) {
-	args := m.Called(project, gitRevision)
-	return args.Get(0).([]AuditLog), args.Error(1)
-}

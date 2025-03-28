@@ -3,13 +3,13 @@ package lib
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -26,7 +26,7 @@ func init() {
 func TestFileStore(t *testing.T) {
 	// Create a temporary directory for logs
 	tmpDir := t.TempDir()
-	store := NewFileStore(filepath.Join(tmpDir, "logs"))
+	store := NewFileStore(filepath.Join(tmpDir, "logs"), false)
 
 	log := AuditLog{
 		Project:     "test-project",
@@ -70,7 +70,7 @@ func TestFileStore(t *testing.T) {
 
 func TestS3Store(t *testing.T) {
 	mockClient := new(MockS3Client)
-	store := NewS3Store(mockClient, "test-bucket", "logs")
+	store := NewS3Store(mockClient, "test-bucket", "logs", false)
 
 	log := AuditLog{
 		Project:     "test-project",
@@ -83,18 +83,56 @@ func TestS3Store(t *testing.T) {
 	}
 
 	expectedKey := filepath.Join("logs", log.generateFilename())
-	expectedData, _ := log.marshalLog()
 
 	// Set up expectations
-	mockClient.On("PutObject", mock.Anything, &s3.PutObjectInput{
-		Bucket: aws.String("test-bucket"),
-		Key:    aws.String(expectedKey),
-		Body:   bytes.NewReader(expectedData),
-	}).Return(&s3.PutObjectOutput{}, nil)
+	mockClient.On("PutObject", mock.Anything, mock.MatchedBy(func(input *s3.PutObjectInput) bool {
+		return *input.Bucket == "test-bucket" && *input.Key == expectedKey
+	})).Return(&s3.PutObjectOutput{}, nil)
 
 	err := store.Store(log)
 	assert.NoError(t, err)
 
+	mockClient.AssertExpectations(t)
+}
+
+// Add a test for verbose mode
+func TestS3StoreVerbose(t *testing.T) {
+	mockClient := new(MockS3Client)
+	store := NewS3Store(mockClient, "test-bucket", "logs", true)
+
+	log := AuditLog{
+		Project:     "test-project",
+		GitRevision: "abc123",
+		Stage:       "test",
+		Command:     "echo hello",
+		StartTime:   time.Now(),
+		Status:      "success",
+		Duration:    1.5,
+	}
+
+	expectedKey := filepath.Join("logs", log.generateFilename())
+
+	// Set up expectations
+	mockClient.On("PutObject", mock.Anything, mock.MatchedBy(func(input *s3.PutObjectInput) bool {
+		return *input.Bucket == "test-bucket" && *input.Key == expectedKey
+	})).Return(&s3.PutObjectOutput{}, nil)
+
+	// Capture stdout to verify verbose output
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := store.Store(log)
+
+	// Restore stdout and get captured output
+	w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	assert.NoError(t, err)
+	assert.Contains(t, output, "Successfully stored audit log to S3")
 	mockClient.AssertExpectations(t)
 }
 

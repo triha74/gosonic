@@ -1,0 +1,33 @@
+version: "1"
+project:
+  name: "aws-cli-example"
+  language: "shell"
+  root: "."
+audit:
+  store: "file"
+  path: ".logs"
+stages:
+  identity:
+    runner: "aws-cli/aws-cli:latest"
+    commands:
+      - "sts get-caller-identity --profile ${AWS_PROFILE}"
+    volumes:
+      - type: bind
+        source: "${HOME}/.aws/"
+        target: "/root/.aws/"
+  s3-list:
+    runner: "aws-cli/aws-cli:latest"
+    commands:
+      - "s3 ls --profile ${AWS_PROFILE}"
+    volumes:
+      - type: bind
+        source: "${HOME}/.aws/"
+        target: "/root/.aws/"
+  ec2-describe:
+    runner: "aws-cli/aws-cli:latest"
+    commands:
+      - "ec2 describe-instances --region ${AWS_REGION:-us-east-1} --profile ${AWS_PROFILE}"
+    volumes:
+      - type: bind
+        source: "${HOME}/.aws/"
+        target: "/root/.aws/" 

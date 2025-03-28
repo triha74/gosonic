@@ -8,14 +8,45 @@ import (
 	"os"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/urfave/cli/v2"
 	"gopkg.in/yaml.v3"
 )
 
 // For testing purposes
 var (
-	createS3Client = func(ctx context.Context) (lib.S3Client, error) {
-		return nil, fmt.Errorf("S3 client creation not implemented")
+	createS3Client = func(verbose bool) (lib.S3Client, error) {
+		// Create context for AWS operations
+		ctx := context.Background()
+		// Look for audit-log specific credentials first
+		auditLogProfile := os.Getenv("AUDIT_LOG_AWS_PROFILE")
+		auditLogAccessKey := os.Getenv("AUDIT_LOG_AWS_ACCESS_KEY_ID")
+		auditLogSecretKey := os.Getenv("AUDIT_LOG_AWS_SECRET_ACCESS_KEY")
+		auditLogSessionToken := os.Getenv("AUDIT_LOG_AWS_SESSION_TOKEN")
+		auditLogRegion := os.Getenv("AUDIT_LOG_AWS_REGION")
+		// Configure AWS SDK options based on profile and region
+
+		var opts []func(*awsconfig.LoadOptions) error
+
+		// Add profile if specified
+		if auditLogProfile != "" {
+			opts = append(opts, awsconfig.WithSharedConfigProfile(auditLogProfile))
+		} else if auditLogAccessKey != "" && auditLogSecretKey != "" && auditLogSessionToken != "" {
+			opts = append(opts, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(auditLogAccessKey, auditLogSecretKey, auditLogSessionToken)))
+		}
+
+		// Add region if specified
+		if auditLogRegion != "" {
+			opts = append(opts, awsconfig.WithRegion(auditLogRegion))
+		}
+
+		// Load AWS configuration with options
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+
+		return s3.NewFromConfig(awsCfg), err
 	}
 )
 
@@ -28,15 +59,21 @@ const (
 
 // defaultCreateAuditStore creates the appropriate audit store based on configuration
 func defaultCreateAuditStore(config *Config, flags *cli.Context) (lib.AuditStore, error) {
+	// Get verbose flag
+	verbose := flags.Bool("verbose")
+
 	// CLI flags take precedence over config file
 	storeType := flags.String("audit-store")
+
 	if storeType == "" {
 		storeType = config.Audit.Store
 	}
 	if storeType == "" {
 		storeType = defaultAuditStore
 	}
-
+	if verbose {
+		fmt.Printf("Using audit store: %s\n", storeType)
+	}
 	switch storeType {
 	case "file":
 		path := flags.String("audit-path")
@@ -46,7 +83,12 @@ func defaultCreateAuditStore(config *Config, flags *cli.Context) (lib.AuditStore
 		if path == "" {
 			path = ".logs"
 		}
-		return lib.NewFileStore(path), nil
+
+		if verbose {
+			fmt.Printf("Using file audit store at path: %s\n", path)
+		}
+
+		return lib.NewFileStore(path, verbose), nil
 
 	case "s3":
 		bucket := flags.String("audit-s3-bucket")
@@ -62,12 +104,22 @@ func defaultCreateAuditStore(config *Config, flags *cli.Context) (lib.AuditStore
 			prefix = config.Audit.Path
 		}
 
+		// Get AWS profile from config if not set in environment
+		awsProfile := os.Getenv("AUDIT_LOG_AWS_PROFILE")
+		if awsProfile == "" && config.Audit.AWSProfile != "" {
+			os.Setenv("AUDIT_LOG_AWS_PROFILE", config.Audit.AWSProfile)
+			if verbose {
+				fmt.Printf("Setting AUDIT_LOG_AWS_PROFILE from config: %s\n", config.Audit.AWSProfile)
+			}
+		}
+
 		// Get S3 client
-		client, err := createS3Client(context.Background())
+		client, err := createS3Client(verbose)
 		if err != nil {
 			return nil, fmt.Errorf("creating S3 client: %w", err)
 		}
-		return lib.NewS3Store(client, bucket, prefix), nil
+
+		return lib.NewS3Store(client, bucket, prefix, verbose), nil
 
 	default:
 		return nil, fmt.Errorf("unknown audit store type: %s", storeType)
@@ -89,12 +141,12 @@ type Config struct {
 		Root     string `yaml:"root"`
 	} `yaml:"project"`
 	Audit struct {
-		Store    string `yaml:"store"`    // "file" or "s3"
-		Path     string `yaml:"path"`     // Directory for file store or S3 prefix
-		S3Bucket string `yaml:"s3bucket"` // S3 bucket name if using S3
+		Store      string `yaml:"store"`       // "file" or "s3"
+		Path       string `yaml:"path"`        // Directory for file store or S3 prefix
+		S3Bucket   string `yaml:"s3bucket"`    // S3 bucket name if using S3
+		AWSProfile string `yaml:"aws_profile"` // AWS profile to use for S3
 	} `yaml:"audit"`
-	Stages     map[string]Stage `yaml:"stages"`
-	StageOrder []string         `yaml:"-"` // Track stage order, not marshaled
+	Stages map[string]Stage `yaml:"stages"`
 }
 
 type MatrixValue struct {
@@ -157,6 +209,11 @@ func resolveStageVars(stage *Stage, vars execVars) {
 		stage.Volumes[i].Source = resolveVars(vol.Source, vars)
 		stage.Volumes[i].Target = resolveVars(vol.Target, vars)
 	}
+
+	// Resolve commands
+	for i, cmd := range stage.Commands {
+		stage.Commands[i] = resolveVars(cmd, vars)
+	}
 }
 
 func loadConfig(path string, vars execVars) (*Config, error) {
@@ -169,31 +226,26 @@ func loadConfig(path string, vars execVars) (*Config, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 
-	// First, decode into a temporary structure to capture order
-	var temp struct {
-		Version string                 `yaml:"version"`
-		Project map[string]interface{} `yaml:"project"`
-		Stages  yaml.Node              `yaml:"stages"`
-	}
-
-	if err := decoder.Decode(&temp); err != nil {
-		return nil, fmt.Errorf("parsing config file: %w", err)
-	}
-
 	// Then decode the full config
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
+	if vars != nil {
+		// Resolve S3 bucket name
+		if config.Audit.S3Bucket != "" {
+			config.Audit.S3Bucket = resolveVars(config.Audit.S3Bucket, vars)
+		}
 
-	// Extract stage order from the Node
-	if temp.Stages.Kind == yaml.MappingNode {
-		for i := 0; i < len(temp.Stages.Content); i += 2 {
-			// Content array contains alternating keys and values
-			stageName := temp.Stages.Content[i].Value
-			config.StageOrder = append(config.StageOrder, stageName)
+		// Resolve AWS profile
+		if config.Audit.AWSProfile != "" {
+			config.Audit.AWSProfile = resolveVars(config.Audit.AWSProfile, vars)
+		}
+
+		// Resolve audit path
+		if config.Audit.Path != "" {
+			config.Audit.Path = resolveVars(config.Audit.Path, vars)
 		}
 	}
-
 	// Resolve variables in all stages
 	for name, stage := range config.Stages {
 		resolveStageVars(&stage, vars)
@@ -278,6 +330,9 @@ func createStageCommand(name string, stage Stage, config *Config) *cli.Command {
 				return fmt.Errorf("stage requirements not met: %w", err)
 			}
 
+			// Get verbose flag
+			verbose := ctx.Bool("verbose")
+
 			// Create stage execution configuration
 			stageExec := lib.StageExecution{
 				Name:        name,
@@ -285,6 +340,7 @@ func createStageCommand(name string, stage Stage, config *Config) *cli.Command {
 				Commands:    stage.Commands,
 				Environment: stage.Environment,
 				Volumes:     stage.Volumes,
+				Verbose:     verbose, // Pass verbose flag
 			}
 
 			// Execute the stage
@@ -334,6 +390,12 @@ func run(args []string) error {
 			Usage:   "Default Docker registry to use when not specified in image reference",
 			Value:   defaultRegistry,
 			EnvVars: []string{"GOSONIC_DEFAULT_REGISTRY"},
+		},
+		&cli.BoolFlag{
+			Name:    "verbose",
+			Usage:   "Enable verbose output",
+			Value:   false,
+			EnvVars: []string{"GOSONIC_VERBOSE"},
 		},
 	}
 
@@ -405,7 +467,7 @@ func run(args []string) error {
 			if len(invalidStages) > 0 {
 				fmt.Fprintf(os.Stderr, "Error: invalid stage(s): %s\n\n", strings.Join(invalidStages, ", "))
 				fmt.Fprintf(os.Stderr, "Available stages:\n")
-				for _, name := range config.StageOrder {
+				for name := range config.Stages {
 					fmt.Fprintf(os.Stderr, "  %s - %s\n", name, config.Stages[name].Runner)
 				}
 				return fmt.Errorf("invalid stage(s) specified")
@@ -426,7 +488,7 @@ func run(args []string) error {
 
 	// Add stage commands for help display
 	if err == nil {
-		for _, name := range config.StageOrder {
+		for name := range config.Stages {
 			stage := config.Stages[name]
 			commands = append(commands, &cli.Command{
 				Name:        name,
@@ -439,6 +501,51 @@ func run(args []string) error {
 			})
 		}
 	}
+
+	// Add this to the commands slice in the run function
+	commands = append(commands, &cli.Command{
+		Name:  "verify-aws-creds",
+		Usage: "Verify AWS credentials for S3 audit logging",
+		Action: func(ctx *cli.Context) error {
+
+			fmt.Println("Verifying AWS credentials for S3 audit logging...")
+
+			// Create S3 client
+			client, err := createS3Client(true) // Always verbose for this command
+			if err != nil {
+				return fmt.Errorf("creating S3 client: %w", err)
+			}
+
+			// Get bucket name
+			bucket := ctx.String("audit-s3-bucket")
+			if bucket == "" {
+				bucket = config.Audit.S3Bucket
+			}
+			if bucket == "" {
+				return fmt.Errorf("s3 bucket must be specified for verification")
+			}
+
+			// Try to list objects in the bucket to verify permissions
+			fmt.Printf("Testing S3 access to bucket: %s\n", bucket)
+			_, err = client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+				Bucket:  aws.String(bucket),
+				MaxKeys: aws.Int32(1),
+			})
+
+			if err != nil {
+				fmt.Printf("Error accessing S3 bucket: %v\n", err)
+				fmt.Println("\nTroubleshooting steps:")
+				fmt.Println("1. Check if the bucket exists and you have permission to access it")
+				fmt.Println("2. Verify your AWS credentials are correct")
+				fmt.Println("3. Check if the bucket is in the correct region")
+				return fmt.Errorf("S3 access test failed: %w", err)
+			}
+
+			fmt.Println("AWS credentials verified successfully!")
+			fmt.Println("S3 bucket access test passed.")
+			return nil
+		},
+	})
 
 	cliApp.Commands = commands
 

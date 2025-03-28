@@ -3,11 +3,15 @@ project:
   name: "hello-world"
   language: "go"
   root: "."
+audit:
+  store: "file"
+  path: ".logs"
 stages:
-  env:
-    runner: "golang"
+  clean:
+    runner: "docker/library/golang:1.20-alpine3.17"
     commands:
-      - "env"
+      - "rm -rf bin"
+      - "rm -rf .logs"
     environment:
       GO111MODULE: "on"
       CGO_ENABLED: "0"
@@ -23,7 +27,7 @@ stages:
     requires:
       - test
     commands:
-      - "CGO_ENABLED=0 go build -o bin/hello-world"
+      - "go build -o bin/hello-world"
     environment:
       GO111MODULE: "on"
       CGO_ENABLED: "0"

@@ -1,11 +1,20 @@
+# GoSonic - Docker-based CI/CD Task Runner
+
 # gosonic
 
 A modern, fully portable, Docker-based CI/CD task execution tool written in Go.
 
 ## Overview
 
-gosonic provides a unified way to build, test, package and deploy applications using Docker containers. It uses a simple YAML configuration file to define stages and their execution environments. gosonic is not a CI/CD pipeline tool, it is a task execution tool, which means that its used within a CI/CD pipeline task to execute a set of commands. So while its similar to tools like Github Actions in its configuration, it is not ment as a replacement for a CI/CD pipeline tool but rather as a replacement for tools like `make` or `Makefile` to execute a set of commands.
+gosonic is a Docker-based task execution tool that provides a unified approach to building, testing, packaging, and deploying applications. While it shares configuration similarities with CI/CD platforms like GitHub Actions, gosonic is specifically designed as a modern replacement for traditional build tools like `make`.
 
+Key distinctions:
+- **Task Executor, Not Pipeline Tool**: gosonic executes tasks within CI/CD pipelines rather than replacing the pipeline itself
+- **Docker-First Design**: All tasks run in isolated Docker containers, ensuring consistent execution environments
+- **Platform Agnostic**: Works identically across different CI/CD platforms (GitHub Actions, GitLab CI, Jenkins, etc.)
+- **Simple Configuration**: Uses a single YAML file to define execution stages and their environments
+
+Think of gosonic as a more powerful, containerized alternative to Makefiles, bringing modern Docker-based isolation and configuration to task execution while maintaining compatibility with any CI/CD platform.
 
 ## Features
 
@@ -17,6 +26,33 @@ gosonic provides a unified way to build, test, package and deploy applications u
 - 📦 Volume mounting for caching and artifacts
 - 🔒 Secure environment variable handling
 - 🏃 Parallel execution support
+
+## Table of Contents
+
+1. [Introduction](#introduction)
+2. [Installation](#installation)
+3. [Configuration](#configuration)
+   - [Project Configuration](#project-configuration)
+   - [Stage Configuration](#stage-configuration)
+   - [Runner Configuration](#runner-configuration)
+   - [Volume Configuration](#volume-configuration)
+4. [Command Line Interface](#command-line-interface)
+   - [Environment Variables](#environment-variables)
+5. [Execution Variables](#execution-variables)
+   - [Using Variables in Configuration](#using-variables-in-configuration)
+6. [Audit Logging](#audit-logging)
+   - [Configuration](#audit-configuration)
+   - [AWS Credentials for S3 Audit Logging](#aws-credentials-for-s3-audit-logging)
+7. [CI/CD Integration](#cicd-integration)
+   - [GitHub Actions](#github-actions)
+   - [GitLab CI](#gitlab-ci)
+   - [Azure DevOps](#azure-devops)
+   - [Benefits of gosonic in CI/CD](#benefits-of-gosonic-in-cicd)
+8. [Security Considerations](#security-considerations)
+9. [Development](#development)
+   - [Building from Source](#building-from-source)
+   - [Running Tests](#running-tests)
+10. [License](#license)
 
 ## Installation
 
@@ -283,6 +319,9 @@ GLOBAL OPTIONS:
                                    Default: "public.ecr.aws"
                                    Environment: GOSONIC_DEFAULT_REGISTRY
    
+   --verbose                       Enable verbose output
+                                   Environment: GOSONIC_VERBOSE
+   
    --help, -h                      Show help
 ```
 
@@ -296,6 +335,7 @@ All command line flags can also be set using environment variables:
 - `SONIC_AUDIT_PATH`: Path for audit logs
 - `SONIC_AUDIT_S3_BUCKET`: S3 bucket for audit logs
 - `GOSONIC_DEFAULT_REGISTRY`: Default Docker registry
+- `GOSONIC_VERBOSE`: Enable verbose output
 
 Example using environment variables:
 ```bash
@@ -399,6 +439,7 @@ audit:
 - Requires:
   - S3 bucket name
   - Optional prefix for organizing logs
+  - AWS credentials (see below)
 - Configure using:
   - Config: `audit.s3bucket` and `audit.path`
   - Flags: `--audit-s3-bucket` and `--audit-path`
@@ -412,6 +453,96 @@ audit:
   path: "ci-logs/"
 ```
 
+### AWS Credentials for S3 Audit Logging
+
+When using S3 for audit logging, gosonic looks for AWS credentials in the following order:
+
+1. Audit-log specific profile:
+   - `AUDIT_LOG_AWS_PROFILE` - Named profile from your AWS config
+
+2. Audit-log specific credentials:
+    - `AUDIT_LOG_AWS_ACCESS_KEY_ID`
+    - `AUDIT_LOG_AWS_SECRET_ACCESS_KEY`
+    - `AUDIT_LOG_AWS_SESSION_TOKEN` (optional)
+    - `AUDIT_LOG_AWS_REGION`
+
+3. Standard AWS credentials (if audit-log specific ones are not provided):
+    - `AWS_ACCESS_KEY_ID`
+    - `AWS_SECRET_ACCESS_KEY`
+    - `AWS_SESSION_TOKEN` (optional)
+    - `AWS_REGION` or `AWS_DEFAULT_REGION`
+
+This allows you to use different AWS credentials for audit logging than for your task executions.
+
+#### Configuring AWS Credentials
+
+There are several ways to configure AWS credentials for audit logging:
+
+1. **Using AWS profiles** (recommended):
+   - Create a named profile in your `~/.aws/credentials` or `~/.aws/config` file
+   - Set the `AUDIT_LOG_AWS_PROFILE` environment variable to use this profile
+   
+   ```ini
+   # In ~/.aws/credentials
+   [audit-profile]
+   aws_access_key_id = AKIAXXXXXXXXXXXXXXXX
+   aws_secret_access_key = XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+   region = us-west-2
+   ```
+   
+   ```bash
+   # Then use the profile
+   export AUDIT_LOG_AWS_PROFILE=audit-profile
+   ```
+
+2. **Using environment variables**:
+   - Set the audit-log specific environment variables
+   
+   ```bash
+   export AUDIT_LOG_AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXX
+   export AUDIT_LOG_AWS_SECRET_ACCESS_KEY=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+   export AUDIT_LOG_AWS_REGION=us-west-2
+   ```
+
+3. **Using IAM roles**:
+   - When running in AWS (EC2, ECS, Lambda), you can use IAM roles
+   - For audit logging, you can use a separate role by configuring a named profile that uses role assumption
+   
+   ```ini
+   # In ~/.aws/config
+   [profile audit-profile]
+   role_arn = arn:aws:iam::123456789012:role/AuditLogRole
+   source_profile = default
+   region = us-west-2
+   ```
+
+4. **Using default credentials**:
+   - If no audit-log specific credentials are provided, gosonic will use the default AWS credentials
+   - This is useful when you want to use the same credentials for both task execution and audit logging
+
+Examples:
+
+Using a named profile:
+```bash
+# Use a specific profile for audit logging
+export AUDIT_LOG_AWS_PROFILE=audit-profile
+export AUDIT_LOG_AWS_REGION=us-west-2
+
+# Run gosonic with S3 audit logging
+gosonic run build --audit-store=s3 --audit-s3-bucket=my-audit-logs
+```
+
+Using explicit credentials:
+```bash
+# Set audit-log specific credentials
+export AUDIT_LOG_AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXX
+export AUDIT_LOG_AWS_SECRET_ACCESS_KEY=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+export AUDIT_LOG_AWS_REGION=us-west-2
+
+# Run gosonic with S3 audit logging
+gosonic run build --audit-store=s3 --audit-s3-bucket=my-audit-logs
+```
+
 ### Configuration Priority
 
 The audit store configuration is resolved in this order:
@@ -419,6 +550,220 @@ The audit store configuration is resolved in this order:
 2. Environment variables
 3. Configuration file
 4. Defaults (file store in `.logs` directory)
+
+
+## CI/CD Integration
+
+gosonic is designed to be portable across different CI/CD platforms while maintaining consistent build behavior. Here are examples of how to integrate gosonic with popular CI/CD tools:
+
+### GitHub Actions
+
+```yaml
+name: Build and Test
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install gosonic
+        run: |
+          go install github.com/triha74/gosonic@latest
+          
+      - name: Run Tests
+        run: gosonic run test
+        
+      - name: Build
+        run: gosonic run build
+        
+      - name: Deploy (if main)
+        if: github.ref == 'refs/heads/main'
+        env:
+          AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: gosonic run deploy
+```
+
+### GitLab CI
+
+```yaml
+image: golang:1.21
+
+stages:
+  - test
+  - build
+  - deploy
+
+before_script:
+  - go install github.com/triha74/gosonic@latest
+
+test:
+  stage: test
+  script:
+    - gosonic run test
+
+build:
+  stage: build
+  script:
+    - gosonic run build
+  artifacts:
+    paths:
+      - bin/
+
+deploy:
+  stage: deploy
+  script:
+    - gosonic run deploy
+  only:
+    - main
+  environment:
+    name: production
+```
+
+### Jenkins Pipeline
+
+```groovy
+pipeline {
+    agent any
+    
+    tools {
+        go 'go-1.21'
+    }
+    
+    stages {
+        stage('Setup') {
+            steps {
+                sh 'go install github.com/triha74/gosonic@latest'
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                sh 'gosonic run test'
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh 'gosonic run build'
+            }
+        }
+        
+        stage('Deploy') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh 'gosonic run deploy'
+            }
+        }
+    }
+}
+```
+
+### Azure DevOps
+
+```yaml
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+- task: Go@0
+  inputs:
+    command: 'get'
+    arguments: 'github.com/triha74/gosonic@latest'
+    
+- script: gosonic run test
+  displayName: 'Run Tests'
+  
+- script: gosonic run build
+  displayName: 'Build'
+  
+- script: gosonic run deploy
+  displayName: 'Deploy'
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+```
+
+### Benefits of gosonic in CI/CD
+
+1. **Consistency Across Platforms**
+   - Same build commands regardless of CI/CD platform
+   - Identical build environment using Docker containers
+   - Consistent artifact outputs
+
+2. **Portable Configuration**
+   - Single `.sonic.yml` file defines all build stages
+   - No need to duplicate build logic across different CI/CD configs
+   - Easy to switch between CI/CD providers
+
+3. **Built-in Audit Trail**
+   - Automatic logging of all build steps
+   - Support for both local and S3-based audit logs
+   - Consistent logging across all platforms
+
+4. **Docker-based Isolation**
+   - Clean build environment for every run
+   - No dependency on CI/CD platform's installed tools
+   - Reproducible builds across environments
+
+5. **Matrix Build Support**
+   - Run builds across multiple configurations
+   - Consistent matrix syntax regardless of CI/CD platform
+   - Easy to test against different versions/platforms
+
+### Example: Matrix Builds
+
+```yaml
+# .sonic.yml
+version: "1"
+project:
+  name: "my-app"
+matrix:
+  region:
+    - name: "us-east-1"
+      priority: 1
+    - name: "eu-west-1"
+      priority: 2
+  environment:
+    - name: "staging"
+      priority: 1
+    - name: "production"
+      priority: 2
+
+stages:
+  deploy:
+    runner: "aws-cli"
+    commands:
+      - "aws deploy create-deployment --region ${region.name} --environment ${environment.name}"
+```
+
+This can be executed in any CI/CD platform:
+
+```bash
+gosonic run deploy --matrix region=us-east-1,eu-west-1 --matrix environment=staging,production
+```
+
+### Security Considerations
+
+1. **Secrets Management**
+   - Use CI/CD platform's native secrets management
+   - Pass secrets as environment variables to gosonic
+   - Avoid hardcoding sensitive values in `.sonic.yml`
+
+2. **Artifact Security**
+   - Use read-only volume mounts for sensitive files
+   - Leverage CI/CD platform's artifact encryption
+   - Enable audit logging for traceability
+
+3. **Access Control**
+   - Use minimal required permissions for service accounts
+   - Leverage CI/CD platform's RBAC features
+   - Implement stage-specific access controls
 
 ## Development
 
