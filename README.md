@@ -34,6 +34,7 @@ Think of gosonic as a more powerful, containerized alternative to Makefiles, bri
 3. [Configuration](#configuration)
    - [Project Configuration](#project-configuration)
    - [Stage Configuration](#stage-configuration)
+   - [Suites](#suites)
    - [Runner Configuration](#runner-configuration)
    - [Volume Configuration](#volume-configuration)
 4. [Command Line Interface](#command-line-interface)
@@ -240,6 +241,29 @@ gosonic build deploy
 ```
 
 Note: gosonic does not automatically run required stages. You must name every stage you want to run. With the default `--jobs 1`, list them in dependency order.
+
+### Suites
+
+A suite is a named list of stages. `gosonic run` expands that name into those stages, in the listed order. A suite does not run `requires` stages that it does not list.
+
+```yaml
+suites:
+  smoke-test:
+    - lint
+    - product-truth
+  full-test:
+    - lint
+    - product-truth
+    - test
+```
+
+```bash
+gosonic run smoke-test
+gosonic run --jobs 4 full-test
+gosonic run lint smoke-test
+```
+
+A stage named by more than one argument is kept at its first position. With `--jobs` greater than 1, the expanded stages use the same dependency scheduler as a list of stage names.
 
 ### Parallel stages
 

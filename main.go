@@ -149,10 +149,11 @@ type Config struct {
 		S3Bucket   string `yaml:"s3bucket"`    // S3 bucket name if using S3
 		AWSProfile string `yaml:"aws_profile"` // AWS profile to use for S3
 	} `yaml:"audit"`
-	Runners Runners           `yaml:"runners,omitempty"`
-	Matrix  MatrixAxes        `yaml:"matrix,omitempty"`
-	Actions map[string]Action `yaml:"actions,omitempty"`
-	Stages  map[string]Stage  `yaml:"stages"`
+	Runners Runners             `yaml:"runners,omitempty"`
+	Matrix  MatrixAxes          `yaml:"matrix,omitempty"`
+	Actions map[string]Action   `yaml:"actions,omitempty"`
+	Suites  map[string][]string `yaml:"suites,omitempty"`
+	Stages  map[string]Stage    `yaml:"stages"`
 }
 
 // Runners maps an alias to a Docker image reference.
@@ -414,8 +415,84 @@ func loadConfig(path string, vars execVars) (*Config, error) {
 		}
 	}
 	applyRunnerAliases(&config, vars)
+	if err := validateSuites(&config); err != nil {
+		return nil, err
+	}
 
 	return &config, nil
+}
+
+// validateSuites checks that each suite is a non-empty list of distinct stages.
+// A suite does not contain other suites, and its name cannot match a stage.
+func validateSuites(config *Config) error {
+	for _, name := range sortedSuiteNames(config.Suites) {
+		if _, ok := config.Stages[name]; ok {
+			return fmt.Errorf("suite %q has the same name as a stage", name)
+		}
+		members := config.Suites[name]
+		if len(members) == 0 {
+			return fmt.Errorf("suite %q has no stages", name)
+		}
+		seen := make(map[string]bool, len(members))
+		for _, member := range members {
+			if _, ok := config.Stages[member]; !ok {
+				return fmt.Errorf("suite %q references unknown stage %q", name, member)
+			}
+			if seen[member] {
+				return fmt.Errorf("suite %q lists stage %q more than once", name, member)
+			}
+			seen[member] = true
+		}
+	}
+	return nil
+}
+
+func sortedSuiteNames(suites map[string][]string) []string {
+	names := make([]string, 0, len(suites))
+	for name := range suites {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+type unknownTargetsError struct {
+	names []string
+}
+
+func (e unknownTargetsError) Error() string {
+	return "invalid stage(s): " + strings.Join(e.names, ", ")
+}
+
+// expandRunTargets replaces suite names with their stages. A stage is kept at
+// its first position when a later suite or argument names it again.
+func expandRunTargets(targets []string, suites map[string][]string, stages map[string]Stage) ([]string, error) {
+	seen := make(map[string]bool, len(targets))
+	var expanded []string
+	var unknown []string
+	for _, target := range targets {
+		if members, ok := suites[target]; ok {
+			for _, name := range members {
+				if !seen[name] {
+					seen[name] = true
+					expanded = append(expanded, name)
+				}
+			}
+			continue
+		}
+		if _, ok := stages[target]; ok {
+			if !seen[target] {
+				seen[target] = true
+				expanded = append(expanded, target)
+			}
+			continue
+		}
+		unknown = append(unknown, target)
+	}
+	if len(unknown) > 0 {
+		return nil, unknownTargetsError{names: unknown}
+	}
+	return expanded, nil
 }
 
 func resolveRunnerName(runner string, runners Runners, vars execVars) string {
@@ -694,11 +771,27 @@ func stageCommandUsage(name string, stage Stage) string {
 	return usage
 }
 
-func formatStageHelp(stages map[string]Stage) string {
-	if len(stages) == 0 {
-		return ""
-	}
+func formatStageHelp(suites map[string][]string, stages map[string]Stage) string {
 	var b strings.Builder
+	if len(suites) > 0 {
+		b.WriteString("Suites:")
+		names := sortedSuiteNames(suites)
+		width := 0
+		for _, name := range names {
+			if len(name) > width {
+				width = len(name)
+			}
+		}
+		for _, name := range names {
+			fmt.Fprintf(&b, "\n  %-*s  %s", width, name, strings.Join(suites[name], ", "))
+		}
+	}
+	if len(stages) == 0 {
+		return b.String()
+	}
+	if b.Len() > 0 {
+		b.WriteString("\n\n")
+	}
 	b.WriteString("Stages, dependencies first:")
 	for _, name := range orderStageNames(stages) {
 		stage := stages[name]
@@ -812,7 +905,7 @@ func run(args []string) error {
 	commands = append(commands, &cli.Command{
 		Name:        "run",
 		Usage:       "Run one or more stages in order, or in parallel with --jobs",
-		Description: formatStageHelp(config.Stages),
+		Description: formatStageHelp(config.Suites, config.Stages),
 		Flags: []cli.Flag{
 			&cli.IntFlag{
 				Name:    "jobs",
@@ -835,24 +928,25 @@ func run(args []string) error {
 				return fmt.Errorf("--jobs must be at least 1")
 			}
 
-			// Get stages to run
-			stages := ctx.Args().Slice()
-
-			// Validate all stages before executing any
-			var invalidStages []string
-			for _, name := range stages {
-				if _, ok := config.Stages[name]; !ok {
-					invalidStages = append(invalidStages, name)
+			// Suites expand to their stages before matrix cells and scheduling.
+			stages, err := expandRunTargets(ctx.Args().Slice(), config.Suites, config.Stages)
+			if err != nil {
+				if unknown, ok := err.(unknownTargetsError); ok {
+					fmt.Fprintf(os.Stderr, "Error: invalid stage(s): %s\n\n", strings.Join(unknown.names, ", "))
+					if len(config.Suites) > 0 {
+						fmt.Fprintf(os.Stderr, "Available suites:\n")
+						for _, name := range sortedSuiteNames(config.Suites) {
+							fmt.Fprintf(os.Stderr, "  %s - %s\n", name, strings.Join(config.Suites[name], ", "))
+						}
+						fmt.Fprintln(os.Stderr)
+					}
+					fmt.Fprintf(os.Stderr, "Available stages:\n")
+					for _, name := range orderStageNames(config.Stages) {
+						fmt.Fprintf(os.Stderr, "  %s - %s\n", name, config.Stages[name].Runner)
+					}
+					return fmt.Errorf("invalid stage(s) specified")
 				}
-			}
-
-			if len(invalidStages) > 0 {
-				fmt.Fprintf(os.Stderr, "Error: invalid stage(s): %s\n\n", strings.Join(invalidStages, ", "))
-				fmt.Fprintf(os.Stderr, "Available stages:\n")
-				for _, name := range orderStageNames(config.Stages) {
-					fmt.Fprintf(os.Stderr, "  %s - %s\n", name, config.Stages[name].Runner)
-				}
-				return fmt.Errorf("invalid stage(s) specified")
+				return err
 			}
 
 			overrides, err := parseMatrixOverrides(ctx.StringSlice("matrix"))

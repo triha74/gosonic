@@ -1016,3 +1016,269 @@ stages:
 	assert.Equal(t, "test-bucket", config.Audit.S3Bucket)
 	assert.Equal(t, "test-profile", config.Audit.AWSProfile)
 }
+
+func TestExpandRunTargetsDedupes(t *testing.T) {
+	stages := map[string]Stage{
+		"lint":      {},
+		"unit-test": {},
+		"build":     {},
+	}
+	suites := map[string][]string{
+		"smoke": {"lint", "unit-test"},
+		"full":  {"unit-test", "build"},
+	}
+
+	got, err := expandRunTargets([]string{"smoke", "full"}, suites, stages)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"lint", "unit-test", "build"}, got)
+
+	got, err = expandRunTargets([]string{"lint", "smoke"}, suites, stages)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"lint", "unit-test"}, got)
+
+	got, err = expandRunTargets([]string{"full", "smoke"}, suites, stages)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"unit-test", "build", "lint"}, got)
+
+	_, err = expandRunTargets([]string{"missing"}, suites, stages)
+	unknown, ok := err.(unknownTargetsError)
+	assert.True(t, ok)
+	assert.Equal(t, []string{"missing"}, unknown.names)
+}
+
+func TestSuiteValidation(t *testing.T) {
+	tests := map[string]struct {
+		config string
+		want   string
+	}{
+		"unknown stage": {
+			config: `
+stages:
+  lint:
+    runner: alpine
+    commands: ["echo lint"]
+suites:
+  smoke:
+    - missing
+`,
+			want: `suite "smoke" references unknown stage "missing"`,
+		},
+		"empty suite": {
+			config: `
+stages:
+  lint:
+    runner: alpine
+    commands: ["echo lint"]
+suites:
+  smoke: []
+`,
+			want: `suite "smoke" has no stages`,
+		},
+		"duplicate stage": {
+			config: `
+stages:
+  lint:
+    runner: alpine
+    commands: ["echo lint"]
+suites:
+  smoke:
+    - lint
+    - lint
+`,
+			want: `suite "smoke" lists stage "lint" more than once`,
+		},
+		"name clash": {
+			config: `
+stages:
+  lint:
+    runner: alpine
+    commands: ["echo lint"]
+suites:
+  lint:
+    - lint
+`,
+			want: `suite "lint" has the same name as a stage`,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "sonic.yml")
+			assert.NoError(t, os.WriteFile(path, []byte(tc.config), 0644))
+			_, err := loadConfig(path, nil)
+			assert.ErrorContains(t, err, tc.want)
+		})
+	}
+}
+
+func TestRunSuiteExpandsInOrder(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "sonic.yml")
+	auditPath := filepath.Join(t.TempDir(), "logs")
+	configData := []byte(`
+version: "1"
+project:
+  name: suite-project
+stages:
+  lint:
+    runner: golang
+    commands: ["echo lint"]
+  unit-test:
+    runner: golang
+    commands: ["echo unit"]
+  build:
+    runner: golang
+    requires: ["unit-test"]
+    commands: ["echo build"]
+suites:
+  smoke:
+    - lint
+    - unit-test
+  full:
+    - unit-test
+    - build
+`)
+	assert.NoError(t, os.WriteFile(configPath, configData, 0644))
+
+	originalExec := lib.ExecDocker
+	defer func() { lib.ExecDocker = originalExec }()
+	var mu sync.Mutex
+	var ran []string
+	lib.ExecDocker = func(args []string) lib.DockerResult {
+		joined := strings.Join(args, " ")
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.Contains(joined, "echo lint"):
+			ran = append(ran, "lint")
+			return lib.DockerResult{Stdout: "lint ok\n"}
+		case strings.Contains(joined, "echo unit"):
+			ran = append(ran, "unit-test")
+			return lib.DockerResult{Stdout: "unit ok\n"}
+		case strings.Contains(joined, "echo build"):
+			ran = append(ran, "build")
+			return lib.DockerResult{Stdout: "build ok\n"}
+		default:
+			return lib.DockerResult{Error: fmt.Errorf("unexpected command %s", joined), ExitCode: 1}
+		}
+	}
+
+	oldGoTest := os.Getenv("GO_TEST")
+	os.Setenv("GO_TEST", "1")
+	defer os.Setenv("GO_TEST", oldGoTest)
+
+	runSuite := func(args ...string) {
+		t.Helper()
+		mu.Lock()
+		ran = nil
+		mu.Unlock()
+		cmd := []string{"gosonic", "--sonic-file", configPath, "--audit-path", auditPath, "run"}
+		_, stderr, err := captureOutput(func() error {
+			return run(append(cmd, args...))
+		})
+		assert.NoError(t, err, stderr)
+	}
+
+	runSuite("smoke")
+	mu.Lock()
+	assert.Equal(t, []string{"lint", "unit-test"}, ran)
+	mu.Unlock()
+
+	runSuite("smoke", "build")
+	mu.Lock()
+	assert.Equal(t, []string{"lint", "unit-test", "build"}, ran)
+	mu.Unlock()
+
+	runSuite("full", "smoke")
+	mu.Lock()
+	assert.Equal(t, []string{"unit-test", "build", "lint"}, ran)
+	mu.Unlock()
+
+	_, stderr, err := captureOutput(func() error {
+		return run([]string{"gosonic", "--sonic-file", configPath, "run", "missing"})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, stderr, "Error: invalid stage(s): missing")
+	assert.Contains(t, stderr, "Available suites:")
+	assert.Contains(t, stderr, "  smoke - lint, unit-test")
+	assert.Contains(t, stderr, "  full - unit-test, build")
+	assert.Contains(t, stderr, "Available stages:")
+	assert.Contains(t, stderr, "  lint - golang")
+
+	helpOut, _, helpErr := captureOutput(func() error {
+		return run([]string{"gosonic", "--sonic-file", configPath, "run", "--help"})
+	})
+	assert.NoError(t, helpErr)
+	assert.Contains(t, helpOut, "Suites:")
+	assert.Contains(t, helpOut, "smoke  lint, unit-test")
+	assert.Contains(t, helpOut, "full   unit-test, build")
+	assert.Less(t, strings.Index(helpOut, "full"), strings.Index(helpOut, "smoke"))
+}
+
+func TestSuiteMatrixAndParallelRequires(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "sonic.yml")
+	auditPath := filepath.Join(t.TempDir(), "logs")
+	configData := []byte(`
+version: "1"
+project:
+  name: suite-matrix
+matrix:
+  shard:
+    - name: engine
+      priority: 1
+    - name: storage
+      priority: 2
+stages:
+  test:
+    runner: golang
+    matrix: [shard]
+    commands: ["echo test"]
+  build:
+    runner: golang
+    requires: ["test"]
+    commands: ["echo build"]
+suites:
+  ci:
+    - test
+    - build
+`)
+	assert.NoError(t, os.WriteFile(configPath, configData, 0644))
+
+	originalExec := lib.ExecDocker
+	defer func() { lib.ExecDocker = originalExec }()
+	var mu sync.Mutex
+	var ran []string
+	lib.ExecDocker = func(args []string) lib.DockerResult {
+		joined := strings.Join(args, " ")
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.Contains(joined, "echo build"):
+			ran = append(ran, "build")
+			return lib.DockerResult{Stdout: "build ok\n"}
+		case strings.Contains(joined, "shard=engine"):
+			ran = append(ran, "engine")
+			return lib.DockerResult{Stdout: "engine ok\n"}
+		case strings.Contains(joined, "shard=storage"):
+			ran = append(ran, "storage")
+			return lib.DockerResult{Stdout: "storage ok\n"}
+		default:
+			return lib.DockerResult{Error: fmt.Errorf("unexpected command %s", joined), ExitCode: 1}
+		}
+	}
+
+	oldGoTest := os.Getenv("GO_TEST")
+	os.Setenv("GO_TEST", "1")
+	defer os.Setenv("GO_TEST", oldGoTest)
+
+	_, stderr, err := captureOutput(func() error {
+		return run([]string{
+			"gosonic", "--sonic-file", configPath, "--audit-path", auditPath,
+			"run", "--jobs", "2", "ci",
+		})
+	})
+	assert.NoError(t, err, stderr)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.ElementsMatch(t, []string{"engine", "storage", "build"}, ran)
+	assert.Equal(t, "build", ran[len(ran)-1])
+}
