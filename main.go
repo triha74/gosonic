@@ -588,7 +588,7 @@ func createStageCommand(name string, stage Stage, config *Config) *cli.Command {
 			}
 			gate := &actionOnce{}
 			for _, inst := range names {
-				if err := runConfiguredStage(ctx, inst, stages[inst], config, nil, false, nil, nil, gate); err != nil {
+				if err := runConfiguredStage(ctx, inst, stages[inst], config, nil, false, nil, nil, gate, nil); err != nil {
 					return err
 				}
 			}
@@ -966,10 +966,12 @@ func run(args []string) error {
 			}
 
 			gate := &actionOnce{}
+			progressSet := lib.NewProgressSet(ctx.Bool("verbose"), jobs > 1)
+			defer progressSet.Close()
 			// jobs == 1 keeps command-line order and does not use the scheduler.
 			if jobs == 1 {
 				for _, name := range runNames {
-					if err := runConfiguredStage(ctx, name, runStages[name], config, nil, false, nil, nil, gate); err != nil {
+					if err := runConfiguredStage(ctx, name, runStages[name], config, nil, false, nil, nil, gate, progressSet); err != nil {
 						return fmt.Errorf("stage %q failed: %w", name, err)
 					}
 				}
@@ -997,7 +999,7 @@ func run(args []string) error {
 
 			var outputMu sync.Mutex
 			return scheduleStages(runNames, runStages, jobs, func(name string) error {
-				return runConfiguredStage(ctx, name, runStages[name], config, inRun, true, &outputMu, auditStore, gate)
+				return runConfiguredStage(ctx, name, runStages[name], config, inRun, true, &outputMu, auditStore, gate, progressSet)
 			})
 		},
 	})

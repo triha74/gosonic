@@ -306,7 +306,7 @@ func prependInline(segments []bodySegment, commands []string) []bodySegment {
 	return append([]bodySegment{{commands: commands}}, segments...)
 }
 
-func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Config, skipRequires map[string]bool, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, gate *actionOnce) error {
+func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Config, skipRequires map[string]bool, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, gate *actionOnce, progressSet *lib.ProgressSet) error {
 	if gate == nil {
 		gate = &actionOnce{}
 	}
@@ -315,8 +315,12 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 		return err
 	}
 	verbose := ctx.Bool("verbose")
+	if progressSet == nil {
+		progressSet = lib.NewProgressSet(verbose, prefixOutput)
+		defer progressSet.Close()
+	}
 	if !ok {
-		lib.PrintSkipped(name, verbose, prefixOutput, outputMu)
+		progressSet.Skip(name)
 		return recordStatus(ctx, config, name, "skipped", auditStore)
 	}
 	if auditStore == nil {
@@ -333,20 +337,20 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 		return fmt.Errorf("stage requirements not met: %w", err)
 	}
 
-	progress := lib.StartProgress(name, verbose, prefixOutput, outputMu)
+	progress := progressSet.Start(name)
 
 	var inlineBefore []string
 	for _, hook := range stage.Before {
 		commands, err := runHook(ctx, hook, stage, config, prefixOutput, outputMu, auditStore, gate, "")
 		if err != nil {
-			return finishQuiet(progress, name, err, prefixOutput, outputMu)
+			return finishQuiet(progressSet, progress, err)
 		}
 		inlineBefore = append(inlineBefore, commands...)
 	}
 
 	segments, err := partitionBody(stage, config)
 	if err != nil {
-		return finishQuiet(progress, name, err, prefixOutput, outputMu)
+		return finishQuiet(progressSet, progress, err)
 	}
 	segments = prependInline(segments, inlineBefore)
 
@@ -398,16 +402,15 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 			afterErr = errors.Join(afterErr, err)
 		}
 	}
-	return finishQuiet(progress, name, errors.Join(bodyErr, afterErr), prefixOutput, outputMu)
+	return finishQuiet(progressSet, progress, errors.Join(bodyErr, afterErr))
 }
 
-func finishQuiet(progress *lib.Progress, name string, err error, prefix bool, mu *sync.Mutex) error {
+func finishQuiet(set *lib.ProgressSet, progress *lib.Progress, err error) error {
 	status := "ok"
 	if err != nil {
 		status = "failed"
 	}
-	progress.Finish(status)
-	lib.WriteCapturedOutput(name, err, prefix, mu)
+	set.Finish(progress, status, err)
 	return err
 }
 
