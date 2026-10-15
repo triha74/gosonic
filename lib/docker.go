@@ -231,6 +231,7 @@ type StageExecution struct {
 	Name             string
 	Runner           string
 	Commands         []string
+	Shell            string
 	Environment      map[string]string
 	Volumes          []Volume
 	Verbose          bool
@@ -264,13 +265,13 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	}
 
 	// A single simple command is the container entrypoint. Multiple commands,
-	// or a command that needs a shell, run under sh -c. Variable expansion
+	// or a command that needs a shell, run under <shell> -c. Variable expansion
 	// happens in that shell so container environment (including matrix
 	// values) is visible. Sonic ${vars} are already resolved at load time.
 	if len(stage.Commands) == 1 && !strings.Contains(stage.Commands[0], "\n") {
 		dockerArgs = append(dockerArgs, splitCommandArgs(stage.Commands[0])...)
 	} else if len(stage.Commands) > 0 {
-		dockerArgs = append(dockerArgs, "sh", "-c", strings.Join(stage.Commands, " && "))
+		dockerArgs = append(dockerArgs, containerShell(stage.Shell), "-c", strings.Join(stage.Commands, " && "))
 	}
 
 	// Quote arguments so the printed command is what the host would run.
@@ -416,6 +417,15 @@ func splitCommandArgs(cmd string) []string {
 	}
 
 	return args
+}
+
+// containerShell is the program used for multiline or multi-command stages.
+// GitHub Actions uses bash; Alpine images typically only have sh. Empty means sh.
+func containerShell(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return "sh"
+	}
+	return name
 }
 
 func buildDockerArgs(stage StageExecution, network string) ([]string, error) {

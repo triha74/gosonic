@@ -314,6 +314,7 @@ func (s *Step) UnmarshalYAML(value *yaml.Node) error {
 type Action struct {
 	Runner           string            `yaml:"runner,omitempty"`
 	Commands         []string          `yaml:"commands,omitempty"`
+	Shell            string            `yaml:"shell,omitempty"`
 	Environment      map[string]string `yaml:"environment,omitempty"`
 	Volumes          []lib.Volume      `yaml:"volumes,omitempty"`
 	DockerSocket     bool              `yaml:"docker_socket,omitempty"`
@@ -326,6 +327,7 @@ type Stage struct {
 	Runner           string            `yaml:"runner,omitempty"`
 	Version          string            `yaml:"version,omitempty"`
 	Commands         []string          `yaml:"commands,omitempty"`
+	Shell            string            `yaml:"shell,omitempty"`
 	Steps            []Step            `yaml:"steps,omitempty"`
 	Before           []HookRef         `yaml:"before,omitempty"`
 	After            []HookRef         `yaml:"after,omitempty"`
@@ -672,6 +674,7 @@ func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, sk
 		Name:             name,
 		Runner:           lib.ResolveRunnerImage(stage.Runner, defaultRegistry),
 		Commands:         stage.Commands,
+		Shell:            stage.Shell,
 		Environment:      stage.Environment,
 		Volumes:          stage.Volumes,
 		Verbose:          ctx.Bool("verbose"),
@@ -920,7 +923,8 @@ func run(args []string) error {
 		},
 		Action: func(ctx *cli.Context) error {
 			if !ctx.Args().Present() {
-				return fmt.Errorf("no stages specified")
+				cli.HelpPrinter(ctx.App.Writer, cli.CommandHelpTemplate, ctx.Command)
+				return nil
 			}
 
 			jobs := ctx.Int("jobs")

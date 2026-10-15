@@ -427,6 +427,7 @@ func runAction(ctx *cli.Context, uses string, action Action, stage Stage, config
 		actionStage := Stage{
 			Runner:           action.Runner,
 			Commands:         action.Commands,
+			Shell:            action.Shell,
 			Environment:      action.Environment,
 			Volumes:          action.Volumes,
 			Timeout:          action.Timeout,
@@ -437,6 +438,9 @@ func runAction(ctx *cli.Context, uses string, action Action, stage Stage, config
 			actionStage.Runner = stage.Runner
 			actionStage.WorkingDirectory = firstNonEmpty(action.WorkingDirectory, stage.WorkingDirectory)
 			actionStage.DockerSocket = action.DockerSocket || stage.DockerSocket
+			if actionStage.Shell == "" {
+				actionStage.Shell = stage.Shell
+			}
 		}
 		return executeStage(ctx, "action:"+uses, actionStage, config, nil, prefixOutput, outputMu, auditStore)
 	}

@@ -1212,6 +1212,19 @@ suites:
 	assert.Contains(t, helpOut, "smoke  lint, unit-test")
 	assert.Contains(t, helpOut, "full   unit-test, build")
 	assert.Less(t, strings.Index(helpOut, "full"), strings.Index(helpOut, "smoke"))
+
+	bareOut, bareErrOut, bareErr := captureOutput(func() error {
+		return run([]string{"gosonic", "--sonic-file", configPath, "run"})
+	})
+	assert.NoError(t, bareErr)
+	assert.Contains(t, bareOut, "NAME:")
+	assert.Contains(t, bareOut, "gosonic run")
+	assert.Contains(t, bareOut, "DESCRIPTION:")
+	assert.Contains(t, bareOut, "Suites:")
+	assert.Contains(t, bareOut, "smoke  lint, unit-test")
+	assert.Contains(t, bareOut, "Stages, dependencies first:")
+	assert.Contains(t, bareOut, "OPTIONS:")
+	assert.NotContains(t, bareErrOut, "no stages specified")
 }
 
 func TestSuiteMatrixAndParallelRequires(t *testing.T) {

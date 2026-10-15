@@ -514,6 +514,26 @@ func TestShellCommandsKeepContainerVariables(t *testing.T) {
 	assert.Contains(t, got, "echo $shard && cargo test")
 }
 
+func TestShellCommandsCanUseBash(t *testing.T) {
+	original := ExecDocker
+	defer func() { ExecDocker = original }()
+	var got []string
+	ExecDocker = func(args []string) DockerResult {
+		got = append([]string{}, args...)
+		return DockerResult{}
+	}
+	err := ExecuteStage(StageExecution{
+		Name:     "test",
+		Runner:   "ubuntu:24.04",
+		Shell:    "bash",
+		Commands: []string{"set -euo pipefail", "echo $shard"},
+	}, nil, "proj")
+	assert.NoError(t, err)
+	assert.Contains(t, got, "bash")
+	assert.NotContains(t, got, "sh")
+	assert.Contains(t, got, "set -euo pipefail && echo $shard")
+}
+
 func TestFormatCommandQuotesShellScript(t *testing.T) {
 	got := formatCommand([]string{"docker", "run", "--rm", "img", "sh", "-c", "echo $shard && cargo test"})
 	assert.Equal(t, "docker run --rm img sh -c 'echo $shard && cargo test'", got)
