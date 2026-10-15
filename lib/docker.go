@@ -76,8 +76,11 @@ func runDockerStreaming(ctx context.Context, args []string, stdout, stderr io.Wr
 	err := cmd.Run()
 	flushWriter(stdout)
 	flushWriter(stderr)
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		err = fmt.Errorf("timed out: %w", ctx.Err())
+	case errors.Is(ctx.Err(), context.Canceled):
+		err = ctx.Err()
 	}
 	exitCode := 0
 	if err != nil {
@@ -241,6 +244,7 @@ type StageExecution struct {
 	Timeout          time.Duration
 	DockerSocket     bool
 	Services         []ServiceSpec
+	Context          context.Context
 }
 
 // ExecuteStage runs a stage in a docker container and handles audit logging
@@ -543,7 +547,13 @@ func runWithCopiedBinds(stage StageExecution, dockerArgs []string) DockerResult 
 // ExecDockerCtx keep that path. The production path streams stdout and stderr
 // and still records them on the result.
 func (stage StageExecution) invokeDocker(args []string) DockerResult {
-	ctx := context.Background()
+	ctx := stage.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return DockerResult{Error: err, ExitCode: 1}
+	}
 	if stage.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, stage.Timeout)
@@ -636,10 +646,16 @@ func dockerCreateArgs(runArgs []string) []string {
 
 func containerResult(ctx context.Context, result DockerResult, streamed bool) DockerResult {
 	result.Streamed = streamed
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		result.Error = fmt.Errorf("timed out: %w", ctx.Err())
 		if result.ExitCode == 0 {
 			result.ExitCode = 124
+		}
+	case errors.Is(ctx.Err(), context.Canceled):
+		result.Error = ctx.Err()
+		if result.ExitCode == 0 {
+			result.ExitCode = 1
 		}
 	}
 	return result

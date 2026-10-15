@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -20,7 +21,7 @@ func TestIndependentStagesStartBeforeDependent(t *testing.T) {
 	bothStarted := make(chan struct{})
 	var once sync.Once
 
-	err := scheduleStages([]string{"lint", "test", "build"}, stages, 4, func(name string) error {
+	err := scheduleStages([]string{"lint", "test", "build"}, stages, 4, func(_ context.Context, name string) error {
 		mu.Lock()
 		starts = append(starts, name)
 		independent := 0
@@ -52,7 +53,7 @@ func TestReadyQueueFollowsCommandLineOrder(t *testing.T) {
 		"lint":    {},
 		"test":    {},
 		"package": {},
-	}, 1, func(name string) error {
+	}, 1, func(_ context.Context, name string) error {
 		starts = append(starts, name)
 		return nil
 	})
@@ -65,7 +66,7 @@ func TestCycleStartsNothing(t *testing.T) {
 	err := scheduleStages([]string{"a", "b"}, map[string]Stage{
 		"a": {Requires: []string{"b"}},
 		"b": {Requires: []string{"a"}},
-	}, 2, func(name string) error {
+	}, 2, func(_ context.Context, name string) error {
 		called = true
 		return nil
 	})
@@ -84,7 +85,7 @@ func TestFailureSkipsUnstartedStages(t *testing.T) {
 		"test":    {},
 		"package": {},
 		"build":   {Requires: []string{"test"}},
-	}, 2, func(name string) error {
+	}, 2, func(_ context.Context, name string) error {
 		mu.Lock()
 		started = append(started, name)
 		mu.Unlock()
@@ -104,4 +105,41 @@ func TestFailureSkipsUnstartedStages(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.ElementsMatch(t, []string{"lint", "test"}, started)
+}
+
+func TestFailureCancelsInFlightAndSkipsReady(t *testing.T) {
+	var mu sync.Mutex
+	var started []string
+	bothRunning := make(chan struct{})
+	var once sync.Once
+
+	err := scheduleStages([]string{"slow", "fail", "later"}, map[string]Stage{
+		"slow":  {},
+		"fail":  {},
+		"later": {},
+	}, 2, func(ctx context.Context, name string) error {
+		mu.Lock()
+		started = append(started, name)
+		n := len(started)
+		mu.Unlock()
+		if n == 2 {
+			once.Do(func() { close(bothRunning) })
+		}
+		switch name {
+		case "slow":
+			<-bothRunning
+			<-ctx.Done()
+			return ctx.Err()
+		case "fail":
+			<-bothRunning
+			return fmt.Errorf("boom")
+		default:
+			return nil
+		}
+	})
+
+	assert.EqualError(t, err, `stage "fail" failed: boom`)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.ElementsMatch(t, []string{"slow", "fail"}, started)
 }

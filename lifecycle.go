@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -306,7 +307,7 @@ func prependInline(segments []bodySegment, commands []string) []bodySegment {
 	return append([]bodySegment{{commands: commands}}, segments...)
 }
 
-func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Config, skipRequires map[string]bool, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, gate *actionOnce, progressSet *lib.ProgressSet) error {
+func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Config, skipRequires map[string]bool, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, gate *actionOnce, progressSet *lib.ProgressSet, runCtx context.Context) error {
 	if gate == nil {
 		gate = &actionOnce{}
 	}
@@ -336,12 +337,18 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 	if err := verifyRequirements(withoutRequires(stage, skipRequires), auditStore, config.Project.Name, gitRev); err != nil {
 		return fmt.Errorf("stage requirements not met: %w", err)
 	}
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	if err := runCtx.Err(); err != nil {
+		return err
+	}
 
 	progress := progressSet.Start(name)
 
 	var inlineBefore []string
 	for _, hook := range stage.Before {
-		commands, err := runHook(ctx, hook, stage, config, prefixOutput, outputMu, auditStore, gate, "")
+		commands, err := runHook(ctx, hook, stage, config, prefixOutput, outputMu, auditStore, gate, "", runCtx)
 		if err != nil {
 			return finishQuiet(progressSet, progress, err)
 		}
@@ -357,7 +364,7 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 	var bodyErr error
 	for i, segment := range segments {
 		if segment.action != nil {
-			bodyErr = runAction(ctx, segment.uses, *segment.action, stage, config, prefixOutput, outputMu, auditStore, gate)
+			bodyErr = runAction(ctx, segment.uses, *segment.action, stage, config, prefixOutput, outputMu, auditStore, gate, runCtx)
 		} else if len(segment.commands) > 0 || stage.Runner != "" {
 			bodyStage := stage
 			bodyStage.Commands = segment.commands
@@ -366,7 +373,7 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 			if len(segments) > 1 {
 				auditName = fmt.Sprintf("%s#%d", name, i+1)
 			}
-			bodyErr = executeStage(ctx, auditName, bodyStage, config, skipRequires, prefixOutput, outputMu, auditStore)
+			bodyErr = executeStage(ctx, auditName, bodyStage, config, skipRequires, prefixOutput, outputMu, auditStore, runCtx)
 		}
 		if bodyErr != nil {
 			break
@@ -397,7 +404,7 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 		if when == "" {
 			when = "always"
 		}
-		_, err := runHook(ctx, HookRef{Uses: hook.Uses, When: when}, stage, config, prefixOutput, outputMu, auditStore, gate, outcome)
+		_, err := runHook(ctx, HookRef{Uses: hook.Uses, When: when}, stage, config, prefixOutput, outputMu, auditStore, gate, outcome, runCtx)
 		if err != nil {
 			afterErr = errors.Join(afterErr, err)
 		}
@@ -407,14 +414,18 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 
 func finishQuiet(set *lib.ProgressSet, progress *lib.Progress, err error) error {
 	status := "ok"
-	if err != nil {
+	switch {
+	case err == nil:
+	case errors.Is(err, context.Canceled):
+		status = "cancelled"
+	default:
 		status = "failed"
 	}
 	set.Finish(progress, status, err)
 	return err
 }
 
-func runHook(ctx *cli.Context, hook HookRef, stage Stage, config *Config, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, gate *actionOnce, outcome string) ([]string, error) {
+func runHook(ctx *cli.Context, hook HookRef, stage Stage, config *Config, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, gate *actionOnce, outcome string, runCtx context.Context) ([]string, error) {
 	when := hook.When
 	if outcome != "" && when == "" {
 		when = "always"
@@ -433,13 +444,13 @@ func runHook(ctx *cli.Context, hook HookRef, stage Stage, config *Config, prefix
 	if action.Runner == "" && !action.Once && outcome == "" {
 		return append([]string{}, action.Commands...), nil
 	}
-	if err := runAction(ctx, hook.Uses, action, stage, config, prefixOutput, outputMu, auditStore, gate); err != nil {
+	if err := runAction(ctx, hook.Uses, action, stage, config, prefixOutput, outputMu, auditStore, gate, runCtx); err != nil {
 		return nil, err
 	}
 	return nil, nil
 }
 
-func runAction(ctx *cli.Context, uses string, action Action, stage Stage, config *Config, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, gate *actionOnce) error {
+func runAction(ctx *cli.Context, uses string, action Action, stage Stage, config *Config, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, gate *actionOnce, runCtx context.Context) error {
 	run := func() error {
 		actionStage := Stage{
 			Runner:           action.Runner,
@@ -459,7 +470,7 @@ func runAction(ctx *cli.Context, uses string, action Action, stage Stage, config
 				actionStage.Shell = stage.Shell
 			}
 		}
-		return executeStage(ctx, "action:"+uses, actionStage, config, nil, prefixOutput, outputMu, auditStore)
+		return executeStage(ctx, "action:"+uses, actionStage, config, nil, prefixOutput, outputMu, auditStore, runCtx)
 	}
 	if action.Once {
 		return gate.Do(uses, run)

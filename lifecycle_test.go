@@ -105,7 +105,7 @@ func TestOnceActionRunsOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			err := withCLI(func(ctx *cli.Context) error {
-				return runConfiguredStage(ctx, name, stage(name), config, nil, false, nil, nil, gate, nil)
+				return runConfiguredStage(ctx, name, stage(name), config, nil, false, nil, nil, gate, nil, nil)
 			})
 			assert.NoError(t, err)
 		}()
@@ -150,7 +150,7 @@ func TestAfterRunsWhenStageFails(t *testing.T) {
 			Runner:   "rust",
 			Commands: []string{"cargo test"},
 			After:    []HookRef{{Uses: "cleanup"}},
-		}, config, nil, false, nil, nil, &actionOnce{}, nil)
+		}, config, nil, false, nil, nil, &actionOnce{}, nil, nil)
 	})
 	assert.Error(t, err)
 	mu.Lock()
@@ -186,7 +186,7 @@ func TestWhenSkipsStage(t *testing.T) {
 			Runner:   "rust",
 			Commands: []string{"cargo test"},
 			When:     "env:NEO4J_URI",
-		}, config, nil, false, nil, nil, &actionOnce{}, nil)
+		}, config, nil, false, nil, nil, &actionOnce{}, nil, nil)
 	})
 	assert.NoError(t, err)
 	assert.False(t, called)

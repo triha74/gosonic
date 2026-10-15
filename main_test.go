@@ -94,6 +94,24 @@ stages:
 	assert.Equal(t, "/home/user/.cache/go-build", unitTest.Volumes[1].Source)
 }
 
+func TestResolveConfigPath(t *testing.T) {
+	wd, err := os.Getwd()
+	assert.NoError(t, err)
+	dir := t.TempDir()
+	assert.NoError(t, os.Chdir(dir))
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	assert.Equal(t, defaultConfigFile, resolveConfigPath(""))
+	assert.Equal(t, "custom.yml", resolveConfigPath("custom.yml"))
+
+	assert.NoError(t, os.WriteFile(legacyConfigFile, []byte("legacy: true"), 0644))
+	assert.Equal(t, legacyConfigFile, resolveConfigPath(""))
+
+	assert.NoError(t, os.MkdirAll(".sonic", 0755))
+	assert.NoError(t, os.WriteFile(defaultConfigFile, []byte("nested: true"), 0644))
+	assert.Equal(t, defaultConfigFile, resolveConfigPath(""))
+}
+
 func TestRunnerAliases(t *testing.T) {
 	const image = "docker/library/golang:1.20-alpine3.17"
 
@@ -832,6 +850,7 @@ stages:
 	// Verify global flags are present
 	expectedFlags := []string{
 		"--sonic-file value, -f value",
+		`default: ".sonic/sonic.yml"`,
 		"--audit-store value",
 		"--audit-path value",
 		"--audit-s3-bucket value",

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,7 +13,7 @@ import (
 // Requirements outside this invocation are ignored here; the caller checks
 // those against the audit store before starting. jobs must be at least 1.
 // The default command path keeps jobs == 1 on the sequential loop instead.
-func scheduleStages(names []string, stages map[string]Stage, jobs int, run func(name string) error) error {
+func scheduleStages(names []string, stages map[string]Stage, jobs int, run func(ctx context.Context, name string) error) error {
 	if jobs < 1 {
 		return fmt.Errorf("jobs must be at least 1")
 	}
@@ -55,6 +57,9 @@ func scheduleStages(names []string, stages map[string]Stage, jobs int, run func(
 		}
 	}
 
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var mu sync.Mutex
 	cond := sync.NewCond(&mu)
 	var firstErr error
@@ -76,16 +81,24 @@ func scheduleStages(names []string, stages map[string]Stage, jobs int, run func(
 			running++
 			mu.Unlock()
 
-			err := run(name)
+			if err := runCtx.Err(); err != nil {
+				mu.Lock()
+				running--
+				cond.Broadcast()
+				mu.Unlock()
+				return
+			}
+			err := run(runCtx, name)
 
 			mu.Lock()
 			running--
 			if err != nil {
-				if firstErr == nil {
+				if firstErr == nil && !errors.Is(err, context.Canceled) {
 					firstErr = fmt.Errorf("stage %q failed: %w", name, err)
 				}
 				cancelled = true
 				ready = nil
+				cancel()
 				cond.Broadcast()
 				mu.Unlock()
 				return

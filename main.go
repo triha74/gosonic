@@ -54,11 +54,27 @@ var (
 )
 
 const (
-	defaultConfigFile = ".sonic.yml"
+	defaultConfigFile = ".sonic/sonic.yml"
+	legacyConfigFile  = ".sonic.yml"
 	defaultRegistry   = "public.ecr.aws"
 	defaultRunner     = "public.ecr.aws/docker/library/alpine:latest"
 	defaultAuditStore = "file"
 )
+
+// resolveConfigPath returns an explicit --sonic-file path, or the first
+// default that exists. Help still advertises defaultConfigFile.
+func resolveConfigPath(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if _, err := os.Stat(defaultConfigFile); err == nil {
+		return defaultConfigFile
+	}
+	if _, err := os.Stat(legacyConfigFile); err == nil {
+		return legacyConfigFile
+	}
+	return defaultConfigFile
+}
 
 // defaultCreateAuditStore creates the appropriate audit store based on configuration
 func defaultCreateAuditStore(config *Config, flags *cli.Context) (lib.AuditStore, error) {
@@ -588,7 +604,7 @@ func createStageCommand(name string, stage Stage, config *Config) *cli.Command {
 			}
 			gate := &actionOnce{}
 			for _, inst := range names {
-				if err := runConfiguredStage(ctx, inst, stages[inst], config, nil, false, nil, nil, gate, nil); err != nil {
+				if err := runConfiguredStage(ctx, inst, stages[inst], config, nil, false, nil, nil, gate, nil, nil); err != nil {
 					return err
 				}
 			}
@@ -633,7 +649,7 @@ func withoutRequires(stage Stage, skip map[string]bool) Stage {
 	return stage
 }
 
-func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, skipRequires map[string]bool, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore) error {
+func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, skipRequires map[string]bool, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, runCtx context.Context) error {
 	var err error
 	if auditStore == nil {
 		auditStore, err = createAuditStore(config, ctx)
@@ -684,6 +700,7 @@ func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, sk
 		Timeout:          timeout,
 		DockerSocket:     stage.DockerSocket,
 		Services:         services,
+		Context:          runCtx,
 	}
 
 	return lib.ExecuteStage(stageExec, auditStore, config.Project.Name)
@@ -860,10 +877,10 @@ func run(args []string) error {
 	}
 
 	// Load config and create commands immediately
-	configPath := defaultConfigFile
+	var configPath string
 	var vars execVars
 	for i, arg := range args {
-		if arg == "--sonic-file" && i+1 < len(args) {
+		if (arg == "--sonic-file" || arg == "-f") && i+1 < len(args) {
 			configPath = args[i+1]
 		}
 		if strings.HasPrefix(arg, "--sonic-file=") {
@@ -879,6 +896,7 @@ func run(args []string) error {
 			}
 		}
 	}
+	configPath = resolveConfigPath(configPath)
 
 	// Start with built-in commands
 	commands := []*cli.Command{
@@ -971,7 +989,7 @@ func run(args []string) error {
 			// jobs == 1 keeps command-line order and does not use the scheduler.
 			if jobs == 1 {
 				for _, name := range runNames {
-					if err := runConfiguredStage(ctx, name, runStages[name], config, nil, false, nil, nil, gate, progressSet); err != nil {
+					if err := runConfiguredStage(ctx, name, runStages[name], config, nil, false, nil, nil, gate, progressSet, nil); err != nil {
 						return fmt.Errorf("stage %q failed: %w", name, err)
 					}
 				}
@@ -998,8 +1016,8 @@ func run(args []string) error {
 			}
 
 			var outputMu sync.Mutex
-			return scheduleStages(runNames, runStages, jobs, func(name string) error {
-				return runConfiguredStage(ctx, name, runStages[name], config, inRun, true, &outputMu, auditStore, gate, progressSet)
+			return scheduleStages(runNames, runStages, jobs, func(runCtx context.Context, name string) error {
+				return runConfiguredStage(ctx, name, runStages[name], config, inRun, true, &outputMu, auditStore, gate, progressSet, runCtx)
 			})
 		},
 	})
