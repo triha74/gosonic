@@ -1,6 +1,8 @@
 package lib
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,18 +27,37 @@ type DockerResult struct {
 	ExitCode int
 }
 
-// execDockerImpl is the actual implementation
+// ExecDocker is a variable that can be overridden in tests
+var ExecDocker = execDockerImpl
+
+// ExecDockerCtx runs docker with a context. Timeout handling uses this so a
+// deadline cancels the container. Tests that only replace ExecDocker keep the
+// non-timeout path.
+var ExecDockerCtx = runDocker
+
 func execDockerImpl(args []string) DockerResult {
-	cmd := exec.Command(args[0], args[1:]...)
+	return runDocker(context.Background(), args)
+}
+
+func runDocker(ctx context.Context, args []string) DockerResult {
+	if len(args) == 0 {
+		return DockerResult{Error: fmt.Errorf("docker command is empty"), ExitCode: 1}
+	}
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		err = fmt.Errorf("timed out: %w", ctx.Err())
+	}
 	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
+		} else if exitCode == 0 {
+			exitCode = 1
 		}
 	}
 
@@ -47,9 +68,6 @@ func execDockerImpl(args []string) DockerResult {
 		ExitCode: exitCode,
 	}
 }
-
-// ExecDocker is a variable that can be overridden in tests
-var ExecDocker = execDockerImpl
 
 // ImageRef represents a parsed Docker image reference
 type ImageRef struct {
@@ -72,8 +90,9 @@ func ParseImageRef(ref string) ImageRef {
 	// Split domain and rest
 	parts := strings.Split(ref, "/")
 
-	// Check if first part is a domain
-	if len(parts) > 1 && (strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":")) {
+	// Check if first part is a domain. localhost has no dot, but it is a
+	// registry host for images built on this machine.
+	if len(parts) > 1 && (parts[0] == "localhost" || strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":")) {
 		image.Domain = parts[0]
 		parts = parts[1:]
 	}
@@ -155,16 +174,28 @@ func ResolveRunnerImage(runner string, defaultRegistry string) string {
 	return ref.String()
 }
 
+// ServiceSpec is a container started beside a stage and removed afterwards.
+type ServiceSpec struct {
+	Name        string
+	Image       string
+	Environment map[string]string
+	Ports       []string
+}
+
 // StageExecution represents the configuration needed to execute a stage
 type StageExecution struct {
-	Name         string
-	Runner       string
-	Commands     []string
-	Environment  map[string]string
-	Volumes      []Volume
-	Verbose      bool
-	PrefixOutput bool        // Prefix each output line with the stage name
-	OutputLock   *sync.Mutex // Shared lock so parallel stages do not interleave lines
+	Name             string
+	Runner           string
+	Commands         []string
+	Environment      map[string]string
+	Volumes          []Volume
+	Verbose          bool
+	PrefixOutput     bool
+	OutputLock       *sync.Mutex
+	WorkingDirectory string
+	Timeout          time.Duration
+	DockerSocket     bool
+	Services         []ServiceSpec
 }
 
 // ExecuteStage runs a stage in a docker container and handles audit logging
@@ -177,55 +208,25 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 		gitRev = "unknown" // Don't fail if we can't get git revision
 	}
 
-	// Build docker command
-	dockerArgs := []string{
-		"docker", "run",
-		"--rm",                    // Remove container after execution
-		"--init",                  // Use tini as init process
-		"--workdir", "/workspace", // Set working directory
+	network, cleanup, err := startServices(stage)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	dockerArgs, err := buildDockerArgs(stage, network)
+	if err != nil {
+		return err
 	}
 
-	// Add environment variables
-	for k, v := range stage.Environment {
-		dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", k, v))
-		if val, exists := os.LookupEnv(v); exists {
-			dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", v, val))
-		}
-	}
-
-	// Add volume mounts
-	for _, vol := range stage.Volumes {
-		mountOpts := []string{}
-		if vol.Readonly {
-			mountOpts = append(mountOpts, "ro")
-		}
-
-		volumeArg := fmt.Sprintf("%s:%s", vol.Source, vol.Target)
-		if len(mountOpts) > 0 {
-			volumeArg += ":" + strings.Join(mountOpts, ",")
-		}
-		dockerArgs = append(dockerArgs, "-v", volumeArg)
-	}
-
-	// Add image name
-	dockerArgs = append(dockerArgs, stage.Runner)
-
-	// Add commands with variable substitution
-	if len(stage.Commands) == 1 {
-		// For a single command, execute directly without shell
-		// First, substitute environment variables in the command
-		command := os.ExpandEnv(stage.Commands[0])
-		args := splitCommandArgs(command)
-		dockerArgs = append(dockerArgs, args...)
-	} else if len(stage.Commands) > 1 {
-		// For multiple commands, use shell
-		// Substitute environment variables in each command
-		expandedCommands := make([]string, len(stage.Commands))
-		for i, cmd := range stage.Commands {
-			expandedCommands[i] = os.ExpandEnv(cmd)
-		}
-		command := strings.Join(expandedCommands, " && ")
-		dockerArgs = append(dockerArgs, "sh", "-c", command)
+	// A single simple command is the container entrypoint. Multiple commands,
+	// or a command that needs a shell, run under sh -c. Variable expansion
+	// happens in that shell so container environment (including matrix
+	// values) is visible. Sonic ${vars} are already resolved at load time.
+	if len(stage.Commands) == 1 && !strings.Contains(stage.Commands[0], "\n") {
+		dockerArgs = append(dockerArgs, splitCommandArgs(stage.Commands[0])...)
+	} else if len(stage.Commands) > 0 {
+		dockerArgs = append(dockerArgs, "sh", "-c", strings.Join(stage.Commands, " && "))
 	}
 
 	// Create the full command string for audit
@@ -256,7 +257,18 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	}
 
 	// Execute docker command
-	result := ExecDocker(dockerArgs)
+	var result DockerResult
+	if stage.Timeout > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), stage.Timeout)
+		defer cancel()
+		result = ExecDockerCtx(ctx, dockerArgs)
+	} else {
+		result = ExecDocker(dockerArgs)
+	}
+	if result.Error != nil && hostMountDenied(result) {
+		stage.printf("Docker cannot mount the workspace from this host; copying it into the container.\n")
+		result = runWithCopiedBinds(stage, dockerArgs)
+	}
 
 	// Print output - always show command output regardless of verbose setting
 	stage.writeOutput(result.Stdout, result.Stderr)
@@ -364,4 +376,218 @@ func splitCommandArgs(cmd string) []string {
 	}
 
 	return args
+}
+
+func buildDockerArgs(stage StageExecution, network string) ([]string, error) {
+	workdir := stage.WorkingDirectory
+	if workdir == "" {
+		workdir = "/workspace"
+	}
+	dockerArgs := []string{
+		"docker", "run",
+		"--rm",
+		"--init",
+		"--workdir", workdir,
+	}
+	if network != "" {
+		dockerArgs = append(dockerArgs, "--network", network)
+	}
+
+	for k, v := range stage.Environment {
+		dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", k, v))
+		if val, exists := os.LookupEnv(v); exists {
+			dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", v, val))
+		}
+	}
+
+	volumes := append([]Volume{}, stage.Volumes...)
+	if stage.DockerSocket {
+		volumes = append(volumes, Volume{
+			Type:   "bind",
+			Source: "/var/run/docker.sock",
+			Target: "/var/run/docker.sock",
+		})
+	}
+	for _, vol := range volumes {
+		arg, err := vol.dockerVolumeArg()
+		if err != nil {
+			return nil, err
+		}
+		dockerArgs = append(dockerArgs, "-v", arg)
+	}
+
+	dockerArgs = append(dockerArgs, stage.Runner)
+	return dockerArgs, nil
+}
+
+func (v Volume) dockerVolumeArg() (string, error) {
+	switch v.Type {
+	case "", "bind":
+		if v.Source == "" || v.Target == "" {
+			return "", fmt.Errorf("bind volume requires source and target")
+		}
+		arg := fmt.Sprintf("%s:%s", v.Source, v.Target)
+		if v.Readonly {
+			arg += ":ro"
+		}
+		return arg, nil
+	case "cache":
+		if v.Source == "" || v.Target == "" {
+			return "", fmt.Errorf("cache volume requires source and target")
+		}
+		arg := fmt.Sprintf("%s:%s", cacheVolumeName(v.Source), v.Target)
+		if v.Readonly {
+			arg += ":ro"
+		}
+		return arg, nil
+	case "tmp":
+		if v.Target == "" {
+			return "", fmt.Errorf("tmp volume requires target")
+		}
+		return v.Target, nil
+	default:
+		return "", fmt.Errorf("unknown volume type %q", v.Type)
+	}
+}
+
+func hostMountDenied(result DockerResult) bool {
+	text := result.Stderr
+	if result.Error != nil {
+		text += "\n" + result.Error.Error()
+	}
+	return strings.Contains(text, "mounts denied") || strings.Contains(text, "not shared from the host")
+}
+
+// copyWorkspaceToVolume streams the working directory into a named volume.
+// Tests replace it. The host target directory is left behind; it is a build
+// cache, not source, and can be larger than the daemon can usefully receive.
+var copyWorkspaceToVolume = streamWorkspaceToVolume
+
+func runWithCopiedBinds(stage StageExecution, dockerArgs []string) DockerResult {
+	volume := fmt.Sprintf("gosonic-ws-%d", time.Now().UnixNano())
+	if result := ExecDocker([]string{"docker", "volume", "create", volume}); result.Error != nil {
+		return result
+	}
+	defer ExecDocker([]string{"docker", "volume", "rm", "-f", volume})
+
+	target := "/workspace"
+	for _, vol := range stage.Volumes {
+		if vol.Source == "." || vol.Source == "./" {
+			if vol.Target != "" {
+				target = vol.Target
+			}
+		}
+	}
+	if result := copyWorkspaceToVolume(stage.Runner, volume, target); result.Error != nil {
+		return result
+	}
+	return ExecDocker(swapRelativeBinds(dockerArgs, volume))
+}
+
+func swapRelativeBinds(args []string, volume string) []string {
+	swapped := append([]string{}, args...)
+	for i := 0; i < len(swapped)-1; i++ {
+		if swapped[i] != "-v" {
+			continue
+		}
+		source, target, ok := splitBind(swapped[i+1])
+		if ok && (source == "." || strings.HasPrefix(source, "./")) {
+			swapped[i+1] = volume + ":" + target
+		}
+	}
+	return swapped
+}
+
+func streamWorkspaceToVolume(image, volume, target string) DockerResult {
+	wd, err := os.Getwd()
+	if err != nil {
+		return DockerResult{Error: fmt.Errorf("finding workspace: %w", err), ExitCode: 1}
+	}
+	tarCmd := exec.Command("tar", "--exclude", "target", "-C", wd, "-cf", "-", ".")
+	load := exec.Command("docker", "run", "--rm", "-i", "--entrypoint", "sh",
+		"-v", volume+":"+target, image, "-c", "mkdir -p "+target+" && tar -xf - -C "+target)
+	reader, writer := io.Pipe()
+	tarCmd.Stdout = writer
+	load.Stdin = reader
+	var stderr strings.Builder
+	tarCmd.Stderr = &stderr
+	load.Stderr = &stderr
+	if err := tarCmd.Start(); err != nil {
+		return DockerResult{Error: err, ExitCode: 1}
+	}
+	if err := load.Start(); err != nil {
+		_ = writer.Close()
+		_ = tarCmd.Wait()
+		return DockerResult{Error: err, Stderr: stderr.String(), ExitCode: 1}
+	}
+	tarErr := make(chan error, 1)
+	go func() {
+		err := tarCmd.Wait()
+		_ = writer.Close()
+		tarErr <- err
+	}()
+	loadErr := load.Wait()
+	if err := <-tarErr; err != nil {
+		return DockerResult{Error: fmt.Errorf("archiving workspace: %w", err), Stderr: stderr.String(), ExitCode: 1}
+	}
+	if loadErr != nil {
+		return DockerResult{Error: fmt.Errorf("loading workspace into volume: %w", loadErr), Stderr: stderr.String(), ExitCode: 1}
+	}
+	return DockerResult{}
+}
+
+func splitBind(spec string) (source, target string, ok bool) {
+	parts := strings.Split(spec, ":")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func cacheVolumeName(source string) string {
+	var b strings.Builder
+	b.WriteString("gosonic-cache-")
+	for _, r := range strings.ToLower(source) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	return strings.TrimRight(b.String(), "-.")
+}
+
+func startServices(stage StageExecution) (string, func(), error) {
+	noop := func() {}
+	if len(stage.Services) == 0 {
+		return "", noop, nil
+	}
+	network := fmt.Sprintf("gosonic-%d", time.Now().UnixNano())
+	if result := ExecDocker([]string{"docker", "network", "create", network}); result.Error != nil {
+		return "", noop, fmt.Errorf("creating service network: %w", result.Error)
+	}
+	var names []string
+	cleanup := func() {
+		for _, name := range names {
+			ExecDocker([]string{"docker", "rm", "-f", name})
+		}
+		ExecDocker([]string{"docker", "network", "rm", network})
+	}
+	for _, svc := range stage.Services {
+		container := network + "-" + strings.TrimPrefix(cacheVolumeName(svc.Name), "gosonic-cache-")
+		args := []string{"docker", "run", "-d", "--name", container, "--network", network, "--network-alias", svc.Name}
+		for k, v := range svc.Environment {
+			args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+		}
+		for _, port := range svc.Ports {
+			args = append(args, "-p", port)
+		}
+		args = append(args, svc.Image)
+		if result := ExecDocker(args); result.Error != nil {
+			cleanup()
+			return "", noop, fmt.Errorf("starting service %s: %w", svc.Name, result.Error)
+		}
+		names = append(names, container)
+	}
+	return network, cleanup, nil
 }

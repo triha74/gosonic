@@ -737,6 +737,10 @@ project:
   name: "test-project"
   language: "go"
   root: "."
+actions:
+  setup:
+    commands:
+      - "echo setup"
 stages:
   unit-test:
     runner: "golang"
@@ -748,6 +752,9 @@ stages:
       - "go build ./..."
   deploy:
     runner: "kubernetes"
+    requires: ["build"]
+    before:
+      - setup
     commands:
       - "kubectl apply -f k8s/"
 `)
@@ -803,6 +810,21 @@ stages:
 		assert.Contains(t, stdout, stage, "Help output should contain stage command %q", stage)
 		assert.Contains(t, stdout, fmt.Sprintf("Run the %s stage", stage), "Help output should contain stage description")
 	}
+
+	buildAt := strings.Index(stdout, "\n   build")
+	deployAt := strings.Index(stdout, "\n   deploy")
+	assert.GreaterOrEqual(t, buildAt, 0)
+	assert.Greater(t, deployAt, buildAt)
+	assert.Contains(t, stdout, "Run the deploy stage; requires build; before setup")
+
+	runHelp, _, runErr := captureOutput(func() error {
+		return run([]string{"gosonic", "--sonic-file", configPath, "run", "--help"})
+	})
+	assert.NoError(t, runErr)
+	assert.Contains(t, runHelp, "Stages, dependencies first:")
+	assert.Less(t, strings.Index(runHelp, "build"), strings.Index(runHelp, "deploy"))
+	assert.Contains(t, runHelp, "requires: build")
+	assert.Contains(t, runHelp, "before: setup")
 
 	// Verify usage information
 	assert.Contains(t, stdout, "NAME:")

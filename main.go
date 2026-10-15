@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"gosonic/lib"
 	"os"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -147,8 +149,10 @@ type Config struct {
 		S3Bucket   string `yaml:"s3bucket"`    // S3 bucket name if using S3
 		AWSProfile string `yaml:"aws_profile"` // AWS profile to use for S3
 	} `yaml:"audit"`
-	Runners Runners          `yaml:"runners,omitempty"`
-	Stages  map[string]Stage `yaml:"stages"`
+	Runners Runners           `yaml:"runners,omitempty"`
+	Matrix  MatrixAxes        `yaml:"matrix,omitempty"`
+	Actions map[string]Action `yaml:"actions,omitempty"`
+	Stages  map[string]Stage  `yaml:"stages"`
 }
 
 // Runners maps an alias to a Docker image reference.
@@ -208,24 +212,133 @@ type MatrixValue struct {
 	Priority int    `yaml:"priority"` // Lower numbers run first
 }
 
-type Matrix struct {
-	Region []MatrixValue `yaml:"region,omitempty"`
-	// Can add more dimensions like environment, platform, etc.
+// MatrixAxes maps a dimension name to its values, in priority order.
+type MatrixAxes map[string][]MatrixValue
+
+func (m *MatrixAxes) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("matrix must be a map of dimensions")
+	}
+	axes := make(MatrixAxes)
+	for i := 0; i < len(value.Content); i += 2 {
+		key := value.Content[i].Value
+		node := value.Content[i+1]
+		if node.Kind != yaml.SequenceNode {
+			return fmt.Errorf("matrix dimension %q must be a list", key)
+		}
+		var values []MatrixValue
+		for _, item := range node.Content {
+			if item.Kind == yaml.ScalarNode {
+				values = append(values, MatrixValue{Name: item.Value})
+				continue
+			}
+			var parsed MatrixValue
+			if err := item.Decode(&parsed); err != nil {
+				return fmt.Errorf("matrix dimension %q: %w", key, err)
+			}
+			if parsed.Name == "" {
+				return fmt.Errorf("matrix dimension %q has a value without a name", key)
+			}
+			values = append(values, parsed)
+		}
+		sort.SliceStable(values, func(a, b int) bool {
+			return values[a].Priority < values[b].Priority
+		})
+		axes[key] = values
+	}
+	*m = axes
+	return nil
+}
+
+type Coverage struct {
+	Enabled   bool   `yaml:"enabled"`
+	Threshold int    `yaml:"threshold"`
+	File      string `yaml:"file,omitempty"`
+	Format    string `yaml:"format,omitempty"`
+}
+
+type Service struct {
+	Name        string            `yaml:"name"`
+	Image       string            `yaml:"image"`
+	Environment map[string]string `yaml:"environment,omitempty"`
+	Ports       []string          `yaml:"ports,omitempty"`
+}
+
+type HookRef struct {
+	Uses string `yaml:"uses"`
+	When string `yaml:"when,omitempty"`
+}
+
+func (h *HookRef) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		h.Uses = value.Value
+		return nil
+	}
+	var raw struct {
+		Uses string `yaml:"uses"`
+		When string `yaml:"when,omitempty"`
+	}
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*h = HookRef{Uses: raw.Uses, When: raw.When}
+	return nil
+}
+
+type Step struct {
+	Uses string `yaml:"uses,omitempty"`
+	Run  string `yaml:"run,omitempty"`
+	When string `yaml:"when,omitempty"`
+}
+
+func (s *Step) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		s.Run = value.Value
+		return nil
+	}
+	var raw struct {
+		Uses string `yaml:"uses,omitempty"`
+		Run  string `yaml:"run,omitempty"`
+		When string `yaml:"when,omitempty"`
+	}
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*s = Step{Uses: raw.Uses, Run: raw.Run, When: raw.When}
+	return nil
+}
+
+// Action is a reusable body. A runner makes it a separate container.
+// Without a runner, its commands are expanded into the calling stage.
+type Action struct {
+	Runner           string            `yaml:"runner,omitempty"`
+	Commands         []string          `yaml:"commands,omitempty"`
+	Environment      map[string]string `yaml:"environment,omitempty"`
+	Volumes          []lib.Volume      `yaml:"volumes,omitempty"`
+	DockerSocket     bool              `yaml:"docker_socket,omitempty"`
+	Once             bool              `yaml:"once,omitempty"`
+	Timeout          string            `yaml:"timeout,omitempty"`
+	WorkingDirectory string            `yaml:"working_directory,omitempty"`
 }
 
 type Stage struct {
-	Runner      string            `yaml:"runner"`
-	Version     string            `yaml:"version,omitempty"`
-	Commands    []string          `yaml:"commands,omitempty"`
-	Requires    []string          `yaml:"requires,omitempty"`
-	Environment map[string]string `yaml:"environment,omitempty"`
-	Volumes     []lib.Volume      `yaml:"volumes,omitempty"`
-	Artifacts   []string          `yaml:"artifacts,omitempty"`
-	Coverage    *struct {
-		Enabled   bool `yaml:"enabled"`
-		Threshold int  `yaml:"threshold"`
-	} `yaml:"coverage,omitempty"`
-	Timeout string `yaml:"timeout,omitempty"`
+	Runner           string            `yaml:"runner,omitempty"`
+	Version          string            `yaml:"version,omitempty"`
+	Commands         []string          `yaml:"commands,omitempty"`
+	Steps            []Step            `yaml:"steps,omitempty"`
+	Before           []HookRef         `yaml:"before,omitempty"`
+	After            []HookRef         `yaml:"after,omitempty"`
+	Requires         []string          `yaml:"requires,omitempty"`
+	Environment      map[string]string `yaml:"environment,omitempty"`
+	Volumes          []lib.Volume      `yaml:"volumes,omitempty"`
+	Artifacts        []string          `yaml:"artifacts,omitempty"`
+	Coverage         *Coverage         `yaml:"coverage,omitempty"`
+	Timeout          string            `yaml:"timeout,omitempty"`
+	When             string            `yaml:"when,omitempty"`
+	WorkingDirectory string            `yaml:"working_directory,omitempty"`
+	DockerSocket     bool              `yaml:"docker_socket,omitempty"`
+	Services         []Service         `yaml:"services,omitempty"`
+	Matrix           []string          `yaml:"matrix,omitempty"`
 }
 
 // execVars holds variables passed during execution
@@ -305,18 +418,37 @@ func loadConfig(path string, vars execVars) (*Config, error) {
 	return &config, nil
 }
 
-// applyRunnerAliases replaces a stage runner with its image when the runner
-// name matches a configured alias. Any other runner string is left unchanged
-// and is still treated as an image reference.
+func resolveRunnerName(runner string, runners Runners, vars execVars) string {
+	runner = resolveVars(runner, vars)
+	if image, ok := runners[runner]; ok {
+		return image
+	}
+	return runner
+}
+
+// applyRunnerAliases replaces a stage or action runner with its image when the
+// runner name matches a configured alias. Any other runner string is left
+// unchanged and is still treated as an image reference.
 func applyRunnerAliases(config *Config, vars execVars) {
 	for alias, image := range config.Runners {
 		config.Runners[alias] = resolveVars(image, vars)
 	}
+	for name, action := range config.Actions {
+		action.Runner = resolveRunnerName(action.Runner, config.Runners, vars)
+		for i, cmd := range action.Commands {
+			action.Commands[i] = resolveVars(cmd, vars)
+		}
+		action.WorkingDirectory = resolveVars(action.WorkingDirectory, vars)
+		config.Actions[name] = action
+	}
 	for name, stage := range config.Stages {
 		resolveStageVars(&stage, vars)
-		stage.Runner = resolveVars(stage.Runner, vars)
-		if image, ok := config.Runners[stage.Runner]; ok {
-			stage.Runner = image
+		stage.Runner = resolveRunnerName(stage.Runner, config.Runners, vars)
+		stage.WorkingDirectory = resolveVars(stage.WorkingDirectory, vars)
+		stage.When = resolveVars(stage.When, vars)
+		for i, step := range stage.Steps {
+			stage.Steps[i].Run = resolveVars(step.Run, vars)
+			stage.Steps[i].When = resolveVars(step.When, vars)
 		}
 		config.Stages[name] = stage
 	}
@@ -334,11 +466,19 @@ func verifyRequirements(stage Stage, auditStore lib.AuditStore, projectName, git
 		return fmt.Errorf("loading audit logs: %w", err)
 	}
 
-	// Create a map of successful stages
-	successful := make(map[string]bool)
+	// The newest log for a stage decides. A later failure must not be hidden
+	// by an earlier success from another container in the same stage.
+	latest := make(map[string]lib.AuditLog)
 	for _, log := range logs {
-		if log.Status == "success" {
-			successful[log.Stage] = true
+		prev, ok := latest[log.Stage]
+		if !ok || !log.StartTime.Before(prev.StartTime) {
+			latest[log.Stage] = log
+		}
+	}
+	successful := make(map[string]bool)
+	for stageName, log := range latest {
+		if log.Status == "success" || log.Status == "skipped" {
+			successful[stageName] = true
 		}
 	}
 
@@ -363,7 +503,17 @@ func createStageCommand(name string, stage Stage, config *Config) *cli.Command {
 		Usage:       fmt.Sprintf("Run the %s stage", name),
 		Description: fmt.Sprintf("Run the %s stage using %s runner", name, stage.Runner),
 		Action: func(ctx *cli.Context) error {
-			return executeStage(ctx, name, stage, config, nil, false, nil, nil)
+			names, stages, err := expandMatrixStages([]string{name}, config, nil)
+			if err != nil {
+				return err
+			}
+			gate := &actionOnce{}
+			for _, inst := range names {
+				if err := runConfiguredStage(ctx, inst, stages[inst], config, nil, false, nil, nil, gate); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 }
@@ -423,18 +573,144 @@ func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, sk
 		return fmt.Errorf("stage requirements not met: %w", err)
 	}
 
+	timeout, err := time.ParseDuration(stage.Timeout)
+	if stage.Timeout != "" && err != nil {
+		return fmt.Errorf("invalid timeout %q: %w", stage.Timeout, err)
+	}
+	if stage.Timeout == "" {
+		timeout = 0
+	}
+
+	services := make([]lib.ServiceSpec, len(stage.Services))
+	for i, svc := range stage.Services {
+		services[i] = lib.ServiceSpec{
+			Name:        svc.Name,
+			Image:       lib.ResolveRunnerImage(svc.Image, defaultRegistry),
+			Environment: svc.Environment,
+			Ports:       svc.Ports,
+		}
+	}
+
 	stageExec := lib.StageExecution{
-		Name:         name,
-		Runner:       lib.ResolveRunnerImage(stage.Runner, defaultRegistry),
-		Commands:     stage.Commands,
-		Environment:  stage.Environment,
-		Volumes:      stage.Volumes,
-		Verbose:      ctx.Bool("verbose"),
-		PrefixOutput: prefixOutput,
-		OutputLock:   outputMu,
+		Name:             name,
+		Runner:           lib.ResolveRunnerImage(stage.Runner, defaultRegistry),
+		Commands:         stage.Commands,
+		Environment:      stage.Environment,
+		Volumes:          stage.Volumes,
+		Verbose:          ctx.Bool("verbose"),
+		PrefixOutput:     prefixOutput,
+		OutputLock:       outputMu,
+		WorkingDirectory: stage.WorkingDirectory,
+		Timeout:          timeout,
+		DockerSocket:     stage.DockerSocket,
+		Services:         services,
 	}
 
 	return lib.ExecuteStage(stageExec, auditStore, config.Project.Name)
+}
+
+// orderStageNames lists stages so a required stage comes before the stages
+// that name it. Stages with no remaining dependencies are ordered by name.
+func orderStageNames(stages map[string]Stage) []string {
+	names := make([]string, 0, len(stages))
+	for name := range stages {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	indegree := make(map[string]int, len(names))
+	dependents := make(map[string][]string, len(names))
+	for _, name := range names {
+		for _, req := range stages[name].Requires {
+			if _, ok := stages[req]; !ok {
+				continue
+			}
+			dependents[req] = append(dependents[req], name)
+			indegree[name]++
+		}
+	}
+
+	var ready []string
+	for _, name := range names {
+		if indegree[name] == 0 {
+			ready = append(ready, name)
+		}
+	}
+	var ordered []string
+	for len(ready) > 0 {
+		name := ready[0]
+		ready = ready[1:]
+		ordered = append(ordered, name)
+		next := append([]string{}, dependents[name]...)
+		sort.Strings(next)
+		for _, dep := range next {
+			indegree[dep]--
+			if indegree[dep] == 0 {
+				ready = insertSorted(ready, dep)
+			}
+		}
+	}
+	if len(ordered) == len(names) {
+		return ordered
+	}
+	seen := make(map[string]bool, len(ordered))
+	for _, name := range ordered {
+		seen[name] = true
+	}
+	for _, name := range names {
+		if !seen[name] {
+			ordered = append(ordered, name)
+		}
+	}
+	return ordered
+}
+
+func insertSorted(names []string, name string) []string {
+	i := sort.SearchStrings(names, name)
+	names = append(names, "")
+	copy(names[i+1:], names[i:])
+	names[i] = name
+	return names
+}
+
+func hookNames(hooks []HookRef) []string {
+	names := make([]string, 0, len(hooks))
+	for _, hook := range hooks {
+		if hook.Uses != "" {
+			names = append(names, hook.Uses)
+		}
+	}
+	return names
+}
+
+func stageCommandUsage(name string, stage Stage) string {
+	usage := fmt.Sprintf("Run the %s stage", name)
+	if reqs := strings.Join(stage.Requires, ", "); reqs != "" {
+		usage += "; requires " + reqs
+	}
+	if hooks := strings.Join(hookNames(stage.Before), ", "); hooks != "" {
+		usage += "; before " + hooks
+	}
+	return usage
+}
+
+func formatStageHelp(stages map[string]Stage) string {
+	if len(stages) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Stages, dependencies first:")
+	for _, name := range orderStageNames(stages) {
+		stage := stages[name]
+		fmt.Fprintf(&b, "\n  %s", name)
+		if len(stage.Requires) > 0 {
+			fmt.Fprintf(&b, "\n    requires: %s", strings.Join(stage.Requires, ", "))
+		}
+		if hooks := hookNames(stage.Before); len(hooks) > 0 {
+			fmt.Fprintf(&b, "\n    before: %s", strings.Join(hooks, ", "))
+		}
+	}
+	return b.String()
 }
 
 func run(args []string) error {
@@ -534,14 +810,19 @@ func run(args []string) error {
 
 	// Add the run command after config is loaded
 	commands = append(commands, &cli.Command{
-		Name:  "run",
-		Usage: "Run one or more stages in order, or in parallel with --jobs",
+		Name:        "run",
+		Usage:       "Run one or more stages in order, or in parallel with --jobs",
+		Description: formatStageHelp(config.Stages),
 		Flags: []cli.Flag{
 			&cli.IntFlag{
 				Name:    "jobs",
 				Aliases: []string{"j"},
 				Value:   1,
 				Usage:   "Maximum number of stages to run at once. 1 runs stages in the listed order",
+			},
+			&cli.StringSliceFlag{
+				Name:  "matrix",
+				Usage: "Override a matrix dimension as key=v1,v2",
 			},
 		},
 		Action: func(ctx *cli.Context) error {
@@ -568,26 +849,37 @@ func run(args []string) error {
 			if len(invalidStages) > 0 {
 				fmt.Fprintf(os.Stderr, "Error: invalid stage(s): %s\n\n", strings.Join(invalidStages, ", "))
 				fmt.Fprintf(os.Stderr, "Available stages:\n")
-				for name := range config.Stages {
+				for _, name := range orderStageNames(config.Stages) {
 					fmt.Fprintf(os.Stderr, "  %s - %s\n", name, config.Stages[name].Runner)
 				}
 				return fmt.Errorf("invalid stage(s) specified")
 			}
 
+			overrides, err := parseMatrixOverrides(ctx.StringSlice("matrix"))
+			if err != nil {
+				return err
+			}
+			if err := validateActionRefs(config); err != nil {
+				return err
+			}
+			runNames, runStages, err := expandMatrixStages(stages, config, overrides)
+			if err != nil {
+				return err
+			}
+
+			gate := &actionOnce{}
 			// jobs == 1 keeps command-line order and does not use the scheduler.
 			if jobs == 1 {
-				for _, name := range stages {
-					stage := config.Stages[name]
-					cmd := createStageCommand(name, stage, config)
-					if err := cmd.Run(ctx); err != nil {
+				for _, name := range runNames {
+					if err := runConfiguredStage(ctx, name, runStages[name], config, nil, false, nil, nil, gate); err != nil {
 						return fmt.Errorf("stage %q failed: %w", name, err)
 					}
 				}
 				return nil
 			}
 
-			inRun := make(map[string]bool, len(stages))
-			for _, name := range stages {
+			inRun := make(map[string]bool, len(runNames))
+			for _, name := range runNames {
 				inRun[name] = true
 			}
 
@@ -599,26 +891,26 @@ func run(args []string) error {
 			if err != nil {
 				gitRev = "unknown"
 			}
-			for _, name := range stages {
-				if err := verifyRequirements(withoutRequires(config.Stages[name], inRun), auditStore, config.Project.Name, gitRev); err != nil {
+			for _, name := range runNames {
+				if err := verifyRequirements(withoutRequires(runStages[name], inRun), auditStore, config.Project.Name, gitRev); err != nil {
 					return fmt.Errorf("stage %q failed: %w", name, fmt.Errorf("stage requirements not met: %w", err))
 				}
 			}
 
 			var outputMu sync.Mutex
-			return scheduleStages(stages, config.Stages, jobs, func(name string) error {
-				return executeStage(ctx, name, config.Stages[name], config, inRun, true, &outputMu, auditStore)
+			return scheduleStages(runNames, runStages, jobs, func(name string) error {
+				return runConfiguredStage(ctx, name, runStages[name], config, inRun, true, &outputMu, auditStore, gate)
 			})
 		},
 	})
 
-	// Add stage commands for help display
+	// Add stage commands for help display, dependencies first.
 	if err == nil {
-		for name := range config.Stages {
+		for _, name := range orderStageNames(config.Stages) {
 			stage := config.Stages[name]
 			commands = append(commands, &cli.Command{
 				Name:        name,
-				Usage:       fmt.Sprintf("Run the %s stage", name),
+				Usage:       stageCommandUsage(name, stage),
 				Description: fmt.Sprintf("Run the %s stage using %s runner", name, stage.Runner),
 				Action: func(ctx *cli.Context) error {
 					cmd := createStageCommand(name, stage, config)

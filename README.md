@@ -68,10 +68,10 @@ git clone https://github.com/triha/gosonic.git
 cd gosonic
 
 # Build and install
-./build.sh
+make
 ```
 
-The build script will:
+`make` will:
 1. Clean previous builds
 2. Update dependencies
 3. Vendor dependencies
@@ -260,7 +260,7 @@ Parallel stages still share the default `.` bind mount at `/workspace`. Do not r
 
 ### Volume Mounts
 
-By default, go-sonic automatically mounts the current directory (`.`) to `/workspace` in the container. This can be overridden by explicitly defining a different workspace mount.
+By default, go-sonic automatically mounts the current directory (`.`) to `/workspace` in the container. This can be overridden by explicitly defining a different workspace mount. If the daemon rejects that bind because the path is not shared from the host, gosonic copies the working directory (except `target/`) into a temporary volume and mounts that instead.
 
 ```yaml
 volumes:
@@ -291,6 +291,65 @@ stages:
         source: "."
         target: "/app"    # Use different workspace
 ```
+
+`type: cache` mounts a named Docker volume. The volume name is derived from `source`, so the same source name reuses the cache across stages and runs. `type: tmp` mounts an anonymous volume at `target`.
+
+```yaml
+volumes:
+  - type: cache
+    source: cargo-registry
+    target: /root/.cargo/registry
+  - type: tmp
+    target: /tmp/work
+```
+
+### Actions, hooks, and stage controls
+
+`actions` defines reusable bodies. A stage runs an action from `before`, `steps`, or `after`.
+
+- An action with `runner` is its own container. Set `docker_socket: true` when that container should talk to the host Docker daemon, for example to `docker build` an image that later stages run.
+- An action without `runner` is a command fragment. Its commands run inside the calling stage's container.
+- `before` must succeed before the stage body starts. `after` defaults to `when: always`, so it also runs when the stage fails. The stage failure is still returned.
+- `once: true` runs that action at most once per `gosonic run`. Every stage that lists it waits for that single run, including under `--jobs`.
+- Each action execution is audited as `action:<name>`.
+
+```yaml
+actions:
+  build-image:
+    runner: docker-cli
+    docker_socket: true
+    once: true
+    commands:
+      - docker build -t localhost/app:dev .
+  setup:
+    commands:
+      - rustup show
+
+stages:
+  test:
+    runner: localhost/app:dev
+    before:
+      - build-image
+      - setup
+    commands:
+      - cargo test
+    after:
+      - uses: setup
+        when: failure
+```
+
+Other stage fields:
+
+- `working_directory`: container workdir. Default `/workspace`.
+- `timeout`: Go duration. The container is killed when it expires.
+- `artifacts`: after a successful stage, copy these workspace-relative paths to `.sonic-artifacts/<stage>/`. A missing path fails the stage.
+- `coverage`: when `enabled` is true, read `file`. `format: percent` reads a number; `format: go` reads a Go cover profile. The stage fails when the percentage is below `threshold`.
+- `when`: skip the stage unless the expression matches. Supported forms are `env:NAME`, `env:NAME=value`, and a leading `!`. A skipped stage is audited as `skipped` and satisfies `requires`. The same expressions gate `after` actions, along with `always`, `success`, and `failure`.
+- `docker_socket`: bind-mount `/var/run/docker.sock` for this stage.
+- `services`: start named containers on a private network before the stage and remove them afterward. Each service has `image`, `environment`, and `ports`. The stage reaches a service by its name.
+- `matrix`: list of dimension names declared under the top-level `matrix` map. Gosonic runs the Cartesian product. Each cell is a stage instance, and each dimension value is exported as an environment variable of that name. `--matrix key=a,b` overrides a dimension for that invocation.
+
+A locally built image needs a registry host in its name. `localhost/app:dev` is used as written. A name with no registry host is prefixed with `public.ecr.aws`.
 
 ### Runner Configuration
 
@@ -775,11 +834,12 @@ matrix:
 stages:
   deploy:
     runner: "aws-cli"
+    matrix: ["region", "environment"]
     commands:
-      - "aws deploy create-deployment --region ${region.name} --environment ${environment.name}"
+      - "aws deploy create-deployment --region $region --environment $environment"
 ```
 
-This can be executed in any CI/CD platform:
+Each cell exports the dimension values as environment variables. Run a subset with `--matrix`:
 
 ```bash
 gosonic run deploy --matrix region=us-east-1,eu-west-1 --matrix environment=staging,production
@@ -815,19 +875,11 @@ Requirements:
 git clone https://github.com/yourusername/go-sonic.git
 cd go-sonic
 
-# Install dependencies
-go mod tidy
-go mod vendor
-
-# Run tests
-go test ./...
-
-# Build the binary
-go build
-
-# Install locally
-go install
+# Clean, vendor, test, build, and install
+make
 ```
+
+Targets: `clean`, `tidy`, `vendor`, `test`, `build`, and `install`. `make` runs them in that order.
 
 ### Running Tests
 

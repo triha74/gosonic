@@ -2,11 +2,13 @@ package lib
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -390,6 +392,129 @@ func TestExecuteStageSuccessIsRecordedAfterExit(t *testing.T) {
 		assert.Equal(t, store.logs[0].StartTime, store.logs[1].StartTime)
 		assert.Positive(t, store.logs[1].Duration)
 	}
+}
+
+func TestDockerRunOptions(t *testing.T) {
+	original := ExecDocker
+	defer func() { ExecDocker = original }()
+
+	var calls [][]string
+	ExecDocker = func(args []string) DockerResult {
+		copied := append([]string{}, args...)
+		calls = append(calls, copied)
+		return DockerResult{}
+	}
+
+	err := ExecuteStage(StageExecution{
+		Name:             "build",
+		Runner:           "alpine:latest",
+		Commands:         []string{"echo hi"},
+		WorkingDirectory: "/workspace/src",
+		DockerSocket:     true,
+		Volumes: []Volume{{
+			Type:   "cache",
+			Source: "cargo registry",
+			Target: "/root/.cargo/registry",
+		}},
+		Services: []ServiceSpec{{
+			Name:  "db",
+			Image: "postgres:16",
+			Ports: []string{"5432:5432"},
+		}},
+	}, nil, "proj")
+	assert.NoError(t, err)
+	requireCalls := func() []string {
+		for _, call := range calls {
+			if len(call) > 2 && call[1] == "run" && call[2] != "-d" {
+				return call
+			}
+		}
+		t.Fatal("stage container was not started")
+		return nil
+	}
+	stageRun := requireCalls()
+	assert.Contains(t, calls[0], "network")
+	assert.Contains(t, calls[1], "postgres:16")
+	assert.Contains(t, stageRun, "--workdir")
+	assert.Contains(t, stageRun, "/workspace/src")
+	assert.Contains(t, stageRun, "--network")
+	assert.Contains(t, stageRun, "gosonic-cache-cargo-registry:/root/.cargo/registry")
+	assert.Contains(t, stageRun, "/var/run/docker.sock:/var/run/docker.sock")
+	assert.Equal(t, "network", calls[len(calls)-1][1])
+}
+
+func TestExecuteStageTimeout(t *testing.T) {
+	original := ExecDockerCtx
+	defer func() { ExecDockerCtx = original }()
+	ExecDockerCtx = func(ctx context.Context, args []string) DockerResult {
+		<-ctx.Done()
+		return DockerResult{Error: ctx.Err(), ExitCode: 1}
+	}
+
+	err := ExecuteStage(StageExecution{
+		Name:     "slow",
+		Runner:   "alpine:latest",
+		Commands: []string{"sleep 30"},
+		Timeout:  20 * time.Millisecond,
+	}, nil, "proj")
+	assert.Error(t, err)
+}
+
+func TestCopiedWorkspaceWhenMountDenied(t *testing.T) {
+	original := ExecDocker
+	originalCopy := copyWorkspaceToVolume
+	defer func() {
+		ExecDocker = original
+		copyWorkspaceToVolume = originalCopy
+	}()
+	var calls [][]string
+	ExecDocker = func(args []string) DockerResult {
+		calls = append(calls, append([]string{}, args...))
+		if len(calls) == 1 {
+			return DockerResult{Error: assert.AnError, Stderr: "mounts denied: The path /workspaces/app is not shared from the host\n", ExitCode: 125}
+		}
+		return DockerResult{}
+	}
+	var copied []string
+	copyWorkspaceToVolume = func(image, volume, target string) DockerResult {
+		copied = []string{image, volume, target}
+		return DockerResult{}
+	}
+	err := ExecuteStage(StageExecution{
+		Name:     "build",
+		Runner:   "alpine:latest",
+		Commands: []string{"echo hi"},
+		Volumes:  []Volume{{Type: "bind", Source: ".", Target: "/workspace"}},
+	}, nil, "proj")
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"alpine:latest", calls[1][len(calls[1])-1], "/workspace"}, copied)
+	assert.Equal(t, "volume", calls[1][1])
+	assert.Equal(t, "create", calls[1][2])
+	assert.Equal(t, "run", calls[2][1])
+	assert.NotContains(t, calls[2], ".:/workspace")
+	assert.Contains(t, calls[2], copied[1]+":/workspace")
+}
+
+func TestShellCommandsKeepContainerVariables(t *testing.T) {
+	original := ExecDocker
+	defer func() { ExecDocker = original }()
+	var got []string
+	ExecDocker = func(args []string) DockerResult {
+		got = append([]string{}, args...)
+		return DockerResult{}
+	}
+	err := ExecuteStage(StageExecution{
+		Name:     "test",
+		Runner:   "alpine:latest",
+		Commands: []string{"echo $shard", "cargo test"},
+	}, nil, "proj")
+	assert.NoError(t, err)
+	assert.Contains(t, got, "sh")
+	assert.Contains(t, got, "echo $shard && cargo test")
+}
+
+func TestResolveLocalhostImage(t *testing.T) {
+	assert.Equal(t, "localhost/cypherlite-sonic-rust:1.88", ResolveRunnerImage("localhost/cypherlite-sonic-rust:1.88", "public.ecr.aws"))
 }
 
 func TestExecuteStagePrefixesOutput(t *testing.T) {
