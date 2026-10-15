@@ -513,6 +513,71 @@ func TestShellCommandsKeepContainerVariables(t *testing.T) {
 	assert.Contains(t, got, "echo $shard && cargo test")
 }
 
+func TestFormatCommandQuotesShellScript(t *testing.T) {
+	got := formatCommand([]string{"docker", "run", "--rm", "img", "sh", "-c", "echo $shard && cargo test"})
+	assert.Equal(t, "docker run --rm img sh -c 'echo $shard && cargo test'", got)
+}
+
+func TestFormatCommandEscapesSingleQuotes(t *testing.T) {
+	got := formatCommand([]string{"sh", "-c", "echo 'hi'"})
+	assert.Equal(t, `sh -c 'echo '"'"'hi'"'"''`, got)
+}
+
+func TestVerboseCommandShowsShellQuoting(t *testing.T) {
+	original := ExecDocker
+	defer func() { ExecDocker = original }()
+	ExecDocker = func(args []string) DockerResult { return DockerResult{} }
+
+	stdout, _ := captureFD(t, func() {
+		err := ExecuteStage(StageExecution{
+			Name:     "test",
+			Runner:   "alpine:latest",
+			Commands: []string{"echo $shard", "cargo test"},
+			Verbose:  true,
+		}, nil, "proj")
+		assert.NoError(t, err)
+	})
+	assert.Contains(t, stdout, "sh -c 'echo $shard && cargo test'")
+}
+
+func TestLinePrefixWriterSplitsChunks(t *testing.T) {
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	w := &linePrefixWriter{w: &buf, prefix: "build", mu: &mu}
+	_, err := w.Write([]byte("hel"))
+	assert.NoError(t, err)
+	assert.Empty(t, buf.String())
+	_, err = w.Write([]byte("lo\nwor"))
+	assert.NoError(t, err)
+	assert.Equal(t, "build | hello\n", buf.String())
+	w.Flush()
+	assert.Equal(t, "build | hello\nbuild | wor\n", buf.String())
+}
+
+func TestRunDockerStreamsBeforeExit(t *testing.T) {
+	r, w, err := os.Pipe()
+	assert.NoError(t, err)
+	defer r.Close()
+
+	started := time.Now()
+	done := make(chan DockerResult, 1)
+	go func() {
+		done <- runDockerStreaming(context.Background(), []string{"sh", "-c", "echo hello; sleep 0.4"}, w, io.Discard)
+	}()
+
+	buf := make([]byte, 16)
+	n, err := r.Read(buf)
+	assert.NoError(t, err)
+	assert.Equal(t, "hello\n", string(buf[:n]))
+	assert.Less(t, time.Since(started), 300*time.Millisecond)
+
+	result := <-done
+	_ = w.Close()
+	assert.NoError(t, result.Error)
+	assert.Equal(t, "hello\n", result.Stdout)
+	assert.True(t, result.Streamed)
+}
+
 func TestResolveLocalhostImage(t *testing.T) {
 	assert.Equal(t, "localhost/cypherlite-sonic-rust:1.88", ResolveRunnerImage("localhost/cypherlite-sonic-rust:1.88", "public.ecr.aws"))
 }

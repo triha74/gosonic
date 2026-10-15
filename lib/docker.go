@@ -1,12 +1,14 @@
 package lib
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,9 @@ type DockerResult struct {
 	Stderr   string
 	Error    error
 	ExitCode int
+	// Streamed is set when stdout and stderr were already written to the console
+	// as the process produced them.
+	Streamed bool
 }
 
 // ExecDocker is a variable that can be overridden in tests
@@ -40,15 +45,36 @@ func execDockerImpl(args []string) DockerResult {
 }
 
 func runDocker(ctx context.Context, args []string) DockerResult {
+	return runDockerStreaming(ctx, args, nil, nil)
+}
+
+// runDockerStreaming runs args[0] and copies stdout and stderr into the returned
+// result. When stdout or stderr is non-nil, each chunk is also written there as
+// it arrives. A nil writer means capture only.
+func runDockerStreaming(ctx context.Context, args []string, stdout, stderr io.Writer) DockerResult {
 	if len(args) == 0 {
 		return DockerResult{Error: fmt.Errorf("docker command is empty"), ExitCode: 1}
 	}
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var outBuf, errBuf strings.Builder
+	stream := stdout != nil || stderr != nil
+	if stream {
+		if stdout == nil {
+			stdout = io.Discard
+		}
+		if stderr == nil {
+			stderr = io.Discard
+		}
+		cmd.Stdout = io.MultiWriter(&outBuf, stdout)
+		cmd.Stderr = io.MultiWriter(&errBuf, stderr)
+	} else {
+		cmd.Stdout = &outBuf
+		cmd.Stderr = &errBuf
+	}
 
 	err := cmd.Run()
+	flushWriter(stdout)
+	flushWriter(stderr)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		err = fmt.Errorf("timed out: %w", ctx.Err())
 	}
@@ -62,11 +88,28 @@ func runDocker(ctx context.Context, args []string) DockerResult {
 	}
 
 	return DockerResult{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
+		Stdout:   outBuf.String(),
+		Stderr:   errBuf.String(),
 		Error:    err,
 		ExitCode: exitCode,
+		Streamed: stream,
 	}
+}
+
+func flushWriter(w io.Writer) {
+	if f, ok := w.(interface{ Flush() }); ok {
+		f.Flush()
+	}
+}
+
+// dockerRunnerReplaced reports whether a test replaced ExecDocker. Production
+// keeps execDockerImpl, which is what streaming uses to tell those paths apart.
+func dockerRunnerReplaced() bool {
+	return reflect.ValueOf(ExecDocker).Pointer() != reflect.ValueOf(execDockerImpl).Pointer()
+}
+
+func dockerCtxReplaced() bool {
+	return reflect.ValueOf(ExecDockerCtx).Pointer() != reflect.ValueOf(runDocker).Pointer()
 }
 
 // ImageRef represents a parsed Docker image reference
@@ -229,8 +272,10 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 		dockerArgs = append(dockerArgs, "sh", "-c", strings.Join(stage.Commands, " && "))
 	}
 
-	// Create the full command string for audit
-	fullCommand := strings.Join(dockerArgs, " ")
+	// Quote arguments so the printed command is what the host would run.
+	// exec receives each argument separately; joining with spaces drops the
+	// quotes around the sh -c script.
+	fullCommand := formatCommand(dockerArgs)
 
 	// Print the command only if verbose is enabled
 	if stage.Verbose {
@@ -256,22 +301,16 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 		}
 	}
 
-	// Execute docker command
-	var result DockerResult
-	if stage.Timeout > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), stage.Timeout)
-		defer cancel()
-		result = ExecDockerCtx(ctx, dockerArgs)
-	} else {
-		result = ExecDocker(dockerArgs)
-	}
+	result := stage.invokeDocker(dockerArgs)
 	if result.Error != nil && hostMountDenied(result) {
 		stage.printf("Docker cannot mount the workspace from this host; copying it into the container.\n")
 		result = runWithCopiedBinds(stage, dockerArgs)
 	}
 
-	// Print output - always show command output regardless of verbose setting
-	stage.writeOutput(result.Stdout, result.Stderr)
+	// Mocked docker returns a finished result. A real container already streamed.
+	if !result.Streamed {
+		stage.writeOutput(result.Stdout, result.Stderr)
+	}
 
 	auditLog.Duration = time.Since(startTime).Seconds()
 	if result.Error != nil {
@@ -481,7 +520,105 @@ func runWithCopiedBinds(stage StageExecution, dockerArgs []string) DockerResult 
 	if result := copyWorkspaceToVolume(stage.Runner, volume, target); result.Error != nil {
 		return result
 	}
-	return ExecDocker(swapRelativeBinds(dockerArgs, volume))
+	return stage.invokeDocker(swapRelativeBinds(dockerArgs, volume))
+}
+
+// invokeDocker runs the stage container. Tests that replace ExecDocker or
+// ExecDockerCtx keep that path. The production path streams stdout and stderr
+// and still records them on the result.
+func (stage StageExecution) invokeDocker(args []string) DockerResult {
+	ctx := context.Background()
+	if stage.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, stage.Timeout)
+		defer cancel()
+		if dockerCtxReplaced() {
+			return ExecDockerCtx(ctx, args)
+		}
+	}
+	if dockerRunnerReplaced() {
+		return ExecDocker(args)
+	}
+	stdout, stderr := stage.consoleWriters()
+	return runDockerStreaming(ctx, args, stdout, stderr)
+}
+
+func (stage StageExecution) consoleWriters() (io.Writer, io.Writer) {
+	if !stage.PrefixOutput {
+		return os.Stdout, os.Stderr
+	}
+	return &linePrefixWriter{w: os.Stdout, prefix: stage.Name, mu: stage.OutputLock},
+		&linePrefixWriter{w: os.Stderr, prefix: stage.Name, mu: stage.OutputLock}
+}
+
+// linePrefixWriter prefixes each complete line. Partial chunks stay buffered so
+// parallel stages do not interleave mid-line. Flush emits a trailing partial line.
+type linePrefixWriter struct {
+	mu     *sync.Mutex
+	w      io.Writer
+	prefix string
+	rest   []byte
+}
+
+func (p *linePrefixWriter) Write(b []byte) (int, error) {
+	if p.mu != nil {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+	}
+	p.rest = append(p.rest, b...)
+	for {
+		i := bytes.IndexByte(p.rest, '\n')
+		if i < 0 {
+			return len(b), nil
+		}
+		line := string(p.rest[:i])
+		p.rest = append([]byte(nil), p.rest[i+1:]...)
+		fmt.Fprintf(p.w, "%s | %s\n", p.prefix, line)
+	}
+}
+
+func (p *linePrefixWriter) Flush() {
+	if p.mu != nil {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+	}
+	if len(p.rest) == 0 {
+		return
+	}
+	fmt.Fprintf(p.w, "%s | %s\n", p.prefix, p.rest)
+	p.rest = nil
+}
+
+// formatCommand renders argv the way a shell would have to quote it.
+// The process is still started with the raw arguments.
+func formatCommand(args []string) string {
+	parts := make([]string, len(args))
+	for i, arg := range args {
+		parts[i] = quoteArg(arg)
+	}
+	return strings.Join(parts, " ")
+}
+
+func quoteArg(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+	if isBareArg(arg) {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'"'"'`) + "'"
+}
+
+func isBareArg(arg string) bool {
+	for _, r := range arg {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune("@%+=:,./_-^", r):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func swapRelativeBinds(args []string, volume string) []string {
