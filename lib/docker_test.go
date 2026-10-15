@@ -3,6 +3,7 @@ package lib
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -667,6 +668,7 @@ func TestExecuteStagePrefixesOutput(t *testing.T) {
 			Name:         "build",
 			Runner:       "alpine:latest",
 			Commands:     []string{"echo hello"},
+			Verbose:      true,
 			PrefixOutput: true,
 			OutputLock:   &mu,
 		}, nil, "proj")
@@ -674,6 +676,44 @@ func TestExecuteStagePrefixesOutput(t *testing.T) {
 	})
 	assert.Contains(t, stdout, "build | hello\n")
 	assert.Contains(t, stderr, "build | warn\n")
+}
+
+func TestQuietExecuteStageHidesSuccessOutput(t *testing.T) {
+	originalExecDocker := ExecDocker
+	defer func() { ExecDocker = originalExecDocker }()
+	ExecDocker = func(args []string) DockerResult {
+		return DockerResult{Stdout: "Tests passed\n"}
+	}
+	stdout, _ := captureFD(t, func() {
+		err := ExecuteStage(StageExecution{
+			Name:     "unit-test",
+			Runner:   "alpine:latest",
+			Commands: []string{"go test ./..."},
+		}, nil, "proj")
+		assert.NoError(t, err)
+	})
+	assert.NotContains(t, stdout, "Tests passed")
+}
+
+func TestQuietExecuteStageCapturesFailure(t *testing.T) {
+	originalExecDocker := ExecDocker
+	defer func() { ExecDocker = originalExecDocker }()
+	ExecDocker = func(args []string) DockerResult {
+		return DockerResult{Stderr: "Root dir must be an absolute path: 'docs'\n", Error: fmt.Errorf("exit status 1"), ExitCode: 1}
+	}
+	stdout, stderr := captureFD(t, func() {
+		err := ExecuteStage(StageExecution{
+			Name:     "link-check",
+			Runner:   "alpine:latest",
+			Commands: []string{"lychee"},
+		}, nil, "proj")
+		var captured *StageOutputError
+		assert.Error(t, err)
+		assert.ErrorAs(t, err, &captured)
+		assert.Contains(t, captured.Stderr, "Root dir must be an absolute path")
+	})
+	assert.NotContains(t, stdout, "Root dir")
+	assert.NotContains(t, stderr, "Root dir")
 }
 
 func captureFD(t *testing.T, fn func()) (string, string) {

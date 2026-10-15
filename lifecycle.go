@@ -314,7 +314,9 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 	if err != nil {
 		return err
 	}
+	verbose := ctx.Bool("verbose")
 	if !ok {
+		lib.PrintSkipped(name, verbose, prefixOutput, outputMu)
 		return recordStatus(ctx, config, name, "skipped", auditStore)
 	}
 	if auditStore == nil {
@@ -331,18 +333,20 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 		return fmt.Errorf("stage requirements not met: %w", err)
 	}
 
+	progress := lib.StartProgress(name, verbose, prefixOutput, outputMu)
+
 	var inlineBefore []string
 	for _, hook := range stage.Before {
 		commands, err := runHook(ctx, hook, stage, config, prefixOutput, outputMu, auditStore, gate, "")
 		if err != nil {
-			return err
+			return finishQuiet(progress, name, err, prefixOutput, outputMu)
 		}
 		inlineBefore = append(inlineBefore, commands...)
 	}
 
 	segments, err := partitionBody(stage, config)
 	if err != nil {
-		return err
+		return finishQuiet(progress, name, err, prefixOutput, outputMu)
 	}
 	segments = prependInline(segments, inlineBefore)
 
@@ -394,7 +398,17 @@ func runConfiguredStage(ctx *cli.Context, name string, stage Stage, config *Conf
 			afterErr = errors.Join(afterErr, err)
 		}
 	}
-	return errors.Join(bodyErr, afterErr)
+	return finishQuiet(progress, name, errors.Join(bodyErr, afterErr), prefixOutput, outputMu)
+}
+
+func finishQuiet(progress *lib.Progress, name string, err error, prefix bool, mu *sync.Mutex) error {
+	status := "ok"
+	if err != nil {
+		status = "failed"
+	}
+	progress.Finish(status)
+	lib.WriteCapturedOutput(name, err, prefix, mu)
+	return err
 }
 
 func runHook(ctx *cli.Context, hook HookRef, stage Stage, config *Config, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, gate *actionOnce, outcome string) ([]string, error) {

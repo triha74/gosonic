@@ -305,12 +305,14 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 
 	result := stage.invokeDocker(dockerArgs)
 	if result.Error != nil && hostMountDenied(result) {
-		stage.printf("Docker cannot mount the workspace from this host; copying it into the container.\n")
+		if stage.Verbose {
+			stage.printf("Docker cannot mount the workspace from this host; copying it into the container.\n")
+		}
 		result = runWithCopiedBinds(stage, dockerArgs)
 	}
 
-	// Mocked docker returns a finished result. A real container already streamed.
-	if !result.Streamed {
+	// Verbose streams live. Quiet keeps the buffer and prints it only on failure.
+	if stage.Verbose && !result.Streamed {
 		stage.writeOutput(result.Stdout, result.Stderr)
 	}
 
@@ -324,6 +326,9 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 		if err := auditStore.Store(auditLog); err != nil {
 			stage.printf("Error writing audit log: %v\n", err)
 		}
+	}
+	if result.Error != nil && !stage.Verbose {
+		return &StageOutputError{Err: result.Error, Stdout: result.Stdout, Stderr: result.Stderr}
 	}
 	return result.Error
 }
@@ -641,6 +646,9 @@ func containerResult(ctx context.Context, result DockerResult, streamed bool) Do
 }
 
 func (stage StageExecution) consoleWriters() (io.Writer, io.Writer) {
+	if !stage.Verbose {
+		return nil, nil
+	}
 	if !stage.PrefixOutput {
 		return os.Stdout, os.Stderr
 	}

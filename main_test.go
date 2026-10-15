@@ -315,12 +315,28 @@ stages:
 		"run all stages in order": {
 			args: []string{"gosonic", "--sonic-file", configPath, "run", "unit-test", "build", "deploy"},
 			wantStdout: []string{
+				"unit-test",
+				"build",
+				"deploy",
+				"ok",
+			},
+			// Quiet mode hides container output. Sequential runs are unprefixed.
+			forbidStdout: []string{
 				"Tests passed",
 				"Build successful",
 				"Deployment complete",
+				"unit-test | ",
+				"build | ",
+				"deploy | ",
+				"\r",
 			},
-			// The default is --jobs 1, which stays on the sequential path.
-			forbidStdout: []string{"unit-test | ", "build | ", "deploy | "},
+		},
+		"verbose still streams command output": {
+			args: []string{"gosonic", "--sonic-file", configPath, "--verbose", "run", "unit-test"},
+			wantStdout: []string{
+				"Tests passed",
+				"Docker command:",
+			},
 		},
 		"jobs must be at least 1": {
 			args:    []string{"gosonic", "--sonic-file", configPath, "run", "--jobs", "0", "unit-test"},
@@ -392,6 +408,45 @@ stages:
 	}
 }
 
+func TestQuietRunDumpsFailureLog(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test-sonic.yml")
+	assert.NoError(t, os.WriteFile(configPath, []byte(`
+version: "1"
+project:
+  name: "quiet-fail"
+stages:
+  link-check:
+    runner: "alpine"
+    commands:
+      - "lychee"
+`), 0644))
+
+	originalExec := lib.ExecDocker
+	defer func() { lib.ExecDocker = originalExec }()
+	lib.ExecDocker = func(args []string) lib.DockerResult {
+		return lib.DockerResult{
+			Stderr:   "Root dir must be an absolute path: 'docs'\n",
+			Error:    fmt.Errorf("exit status 1"),
+			ExitCode: 1,
+		}
+	}
+
+	oldGoTest := os.Getenv("GO_TEST")
+	os.Setenv("GO_TEST", "1")
+	defer os.Setenv("GO_TEST", oldGoTest)
+
+	stdout, stderr, err := captureOutput(func() error {
+		return run([]string{"gosonic", "--sonic-file", configPath, "run", "link-check"})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, stdout, "link-check")
+	assert.Contains(t, stdout, "failed")
+	assert.NotContains(t, stdout, "\r")
+	assert.Contains(t, stderr, "Root dir must be an absolute path: 'docs'")
+	assert.Contains(t, stderr, `Error: stage "link-check" failed`)
+}
+
 func TestParallelRunSchedulesRequiresAndPrefixesOutput(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "test-sonic.yml")
@@ -453,9 +508,12 @@ stages:
 		})
 	})
 	assert.NoError(t, err, stderr)
-	assert.Contains(t, stdout, "lint | lint ok")
-	assert.Contains(t, stdout, "unit-test | Tests passed")
-	assert.Contains(t, stdout, "build | Build successful")
+	assert.Contains(t, stdout, "lint | ok")
+	assert.Contains(t, stdout, "unit-test | ok")
+	assert.Contains(t, stdout, "build | ok")
+	assert.NotContains(t, stdout, "lint ok")
+	assert.NotContains(t, stdout, "Tests passed")
+	assert.NotContains(t, stdout, "\r")
 
 	mu.Lock()
 	defer mu.Unlock()
