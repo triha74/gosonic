@@ -1,7 +1,11 @@
 package lib
 
 import (
+	"bytes"
+	"io"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -351,4 +355,93 @@ func TestExecuteStage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExecuteStageSuccessIsRecordedAfterExit(t *testing.T) {
+	originalExecDocker := ExecDocker
+	defer func() { ExecDocker = originalExecDocker }()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ExecDocker = func(args []string) DockerResult {
+		close(started)
+		<-release
+		return DockerResult{Stdout: "ok\n"}
+	}
+
+	store := &mockAuditStore{}
+	done := make(chan error, 1)
+	go func() {
+		done <- ExecuteStage(StageExecution{
+			Name:     "build",
+			Runner:   "alpine:latest",
+			Commands: []string{"echo ok"},
+		}, store, "proj")
+	}()
+
+	<-started
+	if assert.Len(t, store.logs, 1) {
+		assert.Equal(t, "running", store.logs[0].Status)
+	}
+	close(release)
+	assert.NoError(t, <-done)
+	if assert.Len(t, store.logs, 2) {
+		assert.Equal(t, "success", store.logs[1].Status)
+		assert.Equal(t, store.logs[0].StartTime, store.logs[1].StartTime)
+		assert.Positive(t, store.logs[1].Duration)
+	}
+}
+
+func TestExecuteStagePrefixesOutput(t *testing.T) {
+	originalExecDocker := ExecDocker
+	defer func() { ExecDocker = originalExecDocker }()
+	ExecDocker = func(args []string) DockerResult {
+		return DockerResult{Stdout: "hello\n", Stderr: "warn\n"}
+	}
+
+	var mu sync.Mutex
+	stdout, stderr := captureFD(t, func() {
+		err := ExecuteStage(StageExecution{
+			Name:         "build",
+			Runner:       "alpine:latest",
+			Commands:     []string{"echo hello"},
+			PrefixOutput: true,
+			OutputLock:   &mu,
+		}, nil, "proj")
+		assert.NoError(t, err)
+	})
+	assert.Contains(t, stdout, "build | hello\n")
+	assert.Contains(t, stderr, "build | warn\n")
+}
+
+func captureFD(t *testing.T, fn func()) (string, string) {
+	t.Helper()
+	oldStdout := os.Stdout
+	oldStderr := os.Stderr
+	rOut, wOut, err := os.Pipe()
+	assert.NoError(t, err)
+	rErr, wErr, err := os.Pipe()
+	assert.NoError(t, err)
+	os.Stdout = wOut
+	os.Stderr = wErr
+
+	outC := make(chan string)
+	errC := make(chan string)
+	go func() {
+		var buf bytes.Buffer
+		io.Copy(&buf, rOut)
+		outC <- buf.String()
+	}()
+	go func() {
+		var buf bytes.Buffer
+		io.Copy(&buf, rErr)
+		errC <- buf.String()
+	}()
+
+	fn()
+	wOut.Close()
+	wErr.Close()
+	os.Stdout = oldStdout
+	os.Stderr = oldStderr
+	return <-outC, <-errC
 }

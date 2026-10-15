@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"gosonic/lib"
@@ -91,6 +92,98 @@ stages:
 	assert.NoError(t, err)
 	unitTest := config.Stages["unit-test"]
 	assert.Equal(t, "/home/user/.cache/go-build", unitTest.Volumes[1].Source)
+}
+
+func TestRunnerAliases(t *testing.T) {
+	const image = "docker/library/golang:1.20-alpine3.17"
+
+	tests := map[string]struct {
+		yaml    string
+		vars    execVars
+		want    map[string]string
+		wantErr string
+	}{
+		"list of aliases": {
+			yaml: `
+version: "1"
+runners:
+  - alpine: "docker/library/golang:1.20-alpine3.17"
+stages:
+  test:
+    runner: alpine
+  build:
+    runner: "docker/library/golang:1.22"
+`,
+			want: map[string]string{
+				"test":  image,
+				"build": "docker/library/golang:1.22",
+			},
+		},
+		"mapping of aliases": {
+			yaml: `
+version: "1"
+runners:
+  alpine: "docker/library/golang:1.20-alpine3.17"
+stages:
+  test:
+    runner: alpine
+`,
+			want: map[string]string{"test": image},
+		},
+		"alias image can use variables": {
+			yaml: `
+version: "1"
+runners:
+  - alpine: "${REGISTRY}/golang:1.20-alpine3.17"
+stages:
+  test:
+    runner: alpine
+`,
+			vars: execVars{"REGISTRY": "docker/library"},
+			want: map[string]string{"test": image},
+		},
+		"duplicate alias": {
+			yaml: `
+version: "1"
+runners:
+  - alpine: "docker/library/golang:1.20-alpine3.17"
+  - alpine: "docker/library/golang:1.22"
+stages:
+  test:
+    runner: alpine
+`,
+			wantErr: `duplicate runner alias "alpine"`,
+		},
+		"empty image": {
+			yaml: `
+version: "1"
+runners:
+  - alpine: ""
+stages:
+  test:
+    runner: alpine
+`,
+			wantErr: `runner "alpine" has an empty image`,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ".sonic.yml")
+			err := os.WriteFile(path, []byte(tc.yaml), 0644)
+			assert.NoError(t, err)
+
+			config, err := loadConfig(path, tc.vars)
+			if tc.wantErr != "" {
+				assert.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			assert.NoError(t, err)
+			for stage, runner := range tc.want {
+				assert.Equal(t, runner, config.Stages[stage].Runner)
+			}
+		})
+	}
 }
 
 func captureOutput(f func() error) (stdout string, stderr string, err error) {
@@ -213,10 +306,11 @@ stages:
 	}
 
 	tests := map[string]struct {
-		args       []string
-		wantStdout []string
-		wantStderr []string
-		wantErr    bool
+		args         []string
+		wantStdout   []string
+		wantStderr   []string
+		forbidStdout []string
+		wantErr      bool
 	}{
 		"run all stages in order": {
 			args: []string{"gosonic", "--sonic-file", configPath, "run", "unit-test", "build", "deploy"},
@@ -224,6 +318,15 @@ stages:
 				"Tests passed",
 				"Build successful",
 				"Deployment complete",
+			},
+			// The default is --jobs 1, which stays on the sequential path.
+			forbidStdout: []string{"unit-test | ", "build | ", "deploy | "},
+		},
+		"jobs must be at least 1": {
+			args:    []string{"gosonic", "--sonic-file", configPath, "run", "--jobs", "0", "unit-test"},
+			wantErr: true,
+			wantStderr: []string{
+				"--jobs must be at least 1",
 			},
 		},
 		"invalid stage": {
@@ -272,6 +375,11 @@ stages:
 						t.Errorf("Expected stdout to contain %q but got:\n%s", want, stdout)
 					}
 				}
+				for _, forbidden := range tc.forbidStdout {
+					if strings.Contains(stdout, forbidden) {
+						t.Errorf("Expected stdout not to contain %q but got:\n%s", forbidden, stdout)
+					}
+				}
 				for _, want := range tc.wantStderr {
 					if !strings.Contains(stderr, want) {
 						t.Errorf("Expected stderr to contain %q but got:\n%s", want, stderr)
@@ -282,6 +390,125 @@ stages:
 
 		defer os.Setenv("GO_TEST", originalGoTest)
 	}
+}
+
+func TestParallelRunSchedulesRequiresAndPrefixesOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test-sonic.yml")
+	auditPath := filepath.Join(tmpDir, "logs")
+	configData := []byte(`
+version: "1"
+project:
+  name: "parallel-project"
+stages:
+  lint:
+    runner: "golang"
+    commands:
+      - "echo lint"
+  unit-test:
+    runner: "golang"
+    commands:
+      - "go test ./..."
+  build:
+    runner: "golang"
+    requires: ["unit-test"]
+    commands:
+      - "go build ./..."
+`)
+	err := os.WriteFile(configPath, configData, 0644)
+	assert.NoError(t, err)
+
+	originalExec := lib.ExecDocker
+	defer func() { lib.ExecDocker = originalExec }()
+
+	var mu sync.Mutex
+	var ran []string
+	lib.ExecDocker = func(args []string) lib.DockerResult {
+		joined := strings.Join(args, " ")
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.Contains(joined, "echo lint"):
+			ran = append(ran, "lint")
+			return lib.DockerResult{Stdout: "lint ok\n"}
+		case strings.Contains(joined, "go test"):
+			ran = append(ran, "unit-test")
+			return lib.DockerResult{Stdout: "Tests passed\n"}
+		case strings.Contains(joined, "go build"):
+			ran = append(ran, "build")
+			return lib.DockerResult{Stdout: "Build successful\n"}
+		default:
+			return lib.DockerResult{Error: fmt.Errorf("unexpected command %s", joined), ExitCode: 1}
+		}
+	}
+
+	oldGoTest := os.Getenv("GO_TEST")
+	os.Setenv("GO_TEST", "1")
+	defer os.Setenv("GO_TEST", oldGoTest)
+
+	stdout, stderr, err := captureOutput(func() error {
+		return run([]string{
+			"gosonic", "--sonic-file", configPath, "--audit-path", auditPath,
+			"run", "--jobs", "4", "lint", "unit-test", "build",
+		})
+	})
+	assert.NoError(t, err, stderr)
+	assert.Contains(t, stdout, "lint | lint ok")
+	assert.Contains(t, stdout, "unit-test | Tests passed")
+	assert.Contains(t, stdout, "build | Build successful")
+
+	mu.Lock()
+	defer mu.Unlock()
+	unitTestAt := strings.Index(strings.Join(ran, ","), "unit-test")
+	buildAt := strings.Index(strings.Join(ran, ","), "build")
+	assert.GreaterOrEqual(t, unitTestAt, 0)
+	assert.Greater(t, buildAt, unitTestAt)
+}
+
+func TestParallelRunRejectsUnmetExternalRequirement(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test-sonic.yml")
+	auditPath := filepath.Join(tmpDir, "logs")
+	configData := []byte(`
+version: "1"
+project:
+  name: "parallel-project"
+stages:
+  lint:
+    runner: "golang"
+    commands:
+      - "echo lint"
+  build:
+    runner: "golang"
+    requires: ["test"]
+    commands:
+      - "go build ./..."
+`)
+	err := os.WriteFile(configPath, configData, 0644)
+	assert.NoError(t, err)
+
+	originalExec := lib.ExecDocker
+	defer func() { lib.ExecDocker = originalExec }()
+	calls := 0
+	lib.ExecDocker = func(args []string) lib.DockerResult {
+		calls++
+		return lib.DockerResult{Stdout: "should not run\n"}
+	}
+
+	oldGoTest := os.Getenv("GO_TEST")
+	os.Setenv("GO_TEST", "1")
+	defer os.Setenv("GO_TEST", oldGoTest)
+
+	_, stderr, err := captureOutput(func() error {
+		return run([]string{
+			"gosonic", "--sonic-file", configPath, "--audit-path", auditPath,
+			"run", "--jobs", "2", "lint", "build",
+		})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, stderr, "requirements not met")
+	assert.Contains(t, stderr, "test")
+	assert.Equal(t, 0, calls)
 }
 
 func TestCreateAuditStore(t *testing.T) {

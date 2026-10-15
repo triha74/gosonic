@@ -7,6 +7,7 @@ import (
 	"gosonic/lib"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -146,7 +147,60 @@ type Config struct {
 		S3Bucket   string `yaml:"s3bucket"`    // S3 bucket name if using S3
 		AWSProfile string `yaml:"aws_profile"` // AWS profile to use for S3
 	} `yaml:"audit"`
-	Stages map[string]Stage `yaml:"stages"`
+	Runners Runners          `yaml:"runners,omitempty"`
+	Stages  map[string]Stage `yaml:"stages"`
+}
+
+// Runners maps an alias to a Docker image reference.
+// A mapping and a list of single-alias mappings are both accepted:
+//
+//	runners:
+//	  alpine: "docker/library/golang:1.20-alpine3.17"
+//
+//	runners:
+//	  - alpine: "docker/library/golang:1.20-alpine3.17"
+type Runners map[string]string
+
+func (r *Runners) UnmarshalYAML(value *yaml.Node) error {
+	aliases := make(map[string]string)
+	switch value.Kind {
+	case yaml.MappingNode:
+		if err := value.Decode(&aliases); err != nil {
+			return err
+		}
+	case yaml.SequenceNode:
+		for i, item := range value.Content {
+			if item.Kind != yaml.MappingNode {
+				return fmt.Errorf("runners[%d] must be a map of alias to image", i)
+			}
+			var entry map[string]string
+			if err := item.Decode(&entry); err != nil {
+				return fmt.Errorf("runners[%d]: %w", i, err)
+			}
+			if len(entry) != 1 {
+				return fmt.Errorf("runners[%d] must contain one alias", i)
+			}
+			for alias, image := range entry {
+				if _, exists := aliases[alias]; exists {
+					return fmt.Errorf("duplicate runner alias %q", alias)
+				}
+				aliases[alias] = image
+			}
+		}
+	default:
+		return fmt.Errorf("runners must be a map or a list of alias maps")
+	}
+
+	for alias, image := range aliases {
+		if alias == "" {
+			return fmt.Errorf("runner alias is empty")
+		}
+		if image == "" {
+			return fmt.Errorf("runner %q has an empty image", alias)
+		}
+	}
+	*r = aliases
+	return nil
 }
 
 type MatrixValue struct {
@@ -246,13 +300,26 @@ func loadConfig(path string, vars execVars) (*Config, error) {
 			config.Audit.Path = resolveVars(config.Audit.Path, vars)
 		}
 	}
-	// Resolve variables in all stages
-	for name, stage := range config.Stages {
-		resolveStageVars(&stage, vars)
-		config.Stages[name] = stage
-	}
+	applyRunnerAliases(&config, vars)
 
 	return &config, nil
+}
+
+// applyRunnerAliases replaces a stage runner with its image when the runner
+// name matches a configured alias. Any other runner string is left unchanged
+// and is still treated as an image reference.
+func applyRunnerAliases(config *Config, vars execVars) {
+	for alias, image := range config.Runners {
+		config.Runners[alias] = resolveVars(image, vars)
+	}
+	for name, stage := range config.Stages {
+		resolveStageVars(&stage, vars)
+		stage.Runner = resolveVars(stage.Runner, vars)
+		if image, ok := config.Runners[stage.Runner]; ok {
+			stage.Runner = image
+		}
+		config.Stages[name] = stage
+	}
 }
 
 // VerifyRequirements checks if all required stages have been executed successfully
@@ -291,62 +358,83 @@ func verifyRequirements(stage Stage, auditStore lib.AuditStore, projectName, git
 }
 
 func createStageCommand(name string, stage Stage, config *Config) *cli.Command {
-	// Add default workspace mount if not present
-	hasWorkspaceMount := false
-	for _, vol := range stage.Volumes {
-		if vol.Target == "/workspace" {
-			hasWorkspaceMount = true
-			break
-		}
-	}
-
-	if !hasWorkspaceMount {
-		stage.Volumes = append(stage.Volumes, lib.Volume{
-			Type:   "bind",
-			Source: ".",
-			Target: "/workspace",
-		})
-	}
-
 	return &cli.Command{
 		Name:        name,
 		Usage:       fmt.Sprintf("Run the %s stage", name),
 		Description: fmt.Sprintf("Run the %s stage using %s runner", name, stage.Runner),
 		Action: func(ctx *cli.Context) error {
-			// Create audit store
-			auditStore, err := createAuditStore(config, ctx)
-			if err != nil {
-				return fmt.Errorf("creating audit store: %w", err)
-			}
-
-			// Get git revision
-			gitRev, err := getGitRevision()
-			if err != nil {
-				gitRev = "unknown" // Don't fail if we can't get git revision
-			}
-
-			// Verify requirements before executing
-			if err := verifyRequirements(stage, auditStore, config.Project.Name, gitRev); err != nil {
-				return fmt.Errorf("stage requirements not met: %w", err)
-			}
-
-			// Get verbose flag
-			verbose := ctx.Bool("verbose")
-
-			// Create stage execution configuration
-			stageExec := lib.StageExecution{
-				Name:        name,
-				Runner:      lib.ResolveRunnerImage(stage.Runner, defaultRegistry),
-				Commands:    stage.Commands,
-				Environment: stage.Environment,
-				Volumes:     stage.Volumes,
-				Verbose:     verbose, // Pass verbose flag
-			}
-
-			// Execute the stage
-			return lib.ExecuteStage(stageExec, auditStore, config.Project.Name)
+			return executeStage(ctx, name, stage, config, nil, false, nil, nil)
 		},
 	}
+}
+
+// ensureWorkspaceMount adds the default current-directory mount when the stage
+// does not already bind something at /workspace. The returned stage does not
+// share its volume slice with the caller.
+func ensureWorkspaceMount(stage Stage) Stage {
+	for _, vol := range stage.Volumes {
+		if vol.Target == "/workspace" {
+			return stage
+		}
+	}
+	volumes := make([]lib.Volume, len(stage.Volumes), len(stage.Volumes)+1)
+	copy(volumes, stage.Volumes)
+	stage.Volumes = append(volumes, lib.Volume{
+		Type:   "bind",
+		Source: ".",
+		Target: "/workspace",
+	})
+	return stage
+}
+
+// withoutRequires returns a copy of stage that drops requirements named in skip.
+// Parallel runs use this so in-invocation dependencies are enforced by the
+// scheduler, not by audit logs written while a stage is still running.
+func withoutRequires(stage Stage, skip map[string]bool) Stage {
+	if len(skip) == 0 || len(stage.Requires) == 0 {
+		return stage
+	}
+	kept := make([]string, 0, len(stage.Requires))
+	for _, req := range stage.Requires {
+		if !skip[req] {
+			kept = append(kept, req)
+		}
+	}
+	stage.Requires = kept
+	return stage
+}
+
+func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, skipRequires map[string]bool, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore) error {
+	var err error
+	if auditStore == nil {
+		auditStore, err = createAuditStore(config, ctx)
+		if err != nil {
+			return fmt.Errorf("creating audit store: %w", err)
+		}
+	}
+
+	gitRev, err := getGitRevision()
+	if err != nil {
+		gitRev = "unknown" // Don't fail if we can't get git revision
+	}
+
+	stage = ensureWorkspaceMount(stage)
+	if err := verifyRequirements(withoutRequires(stage, skipRequires), auditStore, config.Project.Name, gitRev); err != nil {
+		return fmt.Errorf("stage requirements not met: %w", err)
+	}
+
+	stageExec := lib.StageExecution{
+		Name:         name,
+		Runner:       lib.ResolveRunnerImage(stage.Runner, defaultRegistry),
+		Commands:     stage.Commands,
+		Environment:  stage.Environment,
+		Volumes:      stage.Volumes,
+		Verbose:      ctx.Bool("verbose"),
+		PrefixOutput: prefixOutput,
+		OutputLock:   outputMu,
+	}
+
+	return lib.ExecuteStage(stageExec, auditStore, config.Project.Name)
 }
 
 func run(args []string) error {
@@ -447,10 +535,23 @@ func run(args []string) error {
 	// Add the run command after config is loaded
 	commands = append(commands, &cli.Command{
 		Name:  "run",
-		Usage: "Run one or more stages in sequence",
+		Usage: "Run one or more stages in order, or in parallel with --jobs",
+		Flags: []cli.Flag{
+			&cli.IntFlag{
+				Name:    "jobs",
+				Aliases: []string{"j"},
+				Value:   1,
+				Usage:   "Maximum number of stages to run at once. 1 runs stages in the listed order",
+			},
+		},
 		Action: func(ctx *cli.Context) error {
 			if !ctx.Args().Present() {
 				return fmt.Errorf("no stages specified")
+			}
+
+			jobs := ctx.Int("jobs")
+			if jobs < 1 {
+				return fmt.Errorf("--jobs must be at least 1")
 			}
 
 			// Get stages to run
@@ -473,16 +574,41 @@ func run(args []string) error {
 				return fmt.Errorf("invalid stage(s) specified")
 			}
 
-			// Execute each stage
-			for _, name := range stages {
-				stage := config.Stages[name]
+			// jobs == 1 keeps command-line order and does not use the scheduler.
+			if jobs == 1 {
+				for _, name := range stages {
+					stage := config.Stages[name]
+					cmd := createStageCommand(name, stage, config)
+					if err := cmd.Run(ctx); err != nil {
+						return fmt.Errorf("stage %q failed: %w", name, err)
+					}
+				}
+				return nil
+			}
 
-				cmd := createStageCommand(name, stage, config)
-				if err := cmd.Run(ctx); err != nil {
-					return fmt.Errorf("stage %q failed: %w", name, err)
+			inRun := make(map[string]bool, len(stages))
+			for _, name := range stages {
+				inRun[name] = true
+			}
+
+			auditStore, err := createAuditStore(config, ctx)
+			if err != nil {
+				return fmt.Errorf("creating audit store: %w", err)
+			}
+			gitRev, err := getGitRevision()
+			if err != nil {
+				gitRev = "unknown"
+			}
+			for _, name := range stages {
+				if err := verifyRequirements(withoutRequires(config.Stages[name], inRun), auditStore, config.Project.Name, gitRev); err != nil {
+					return fmt.Errorf("stage %q failed: %w", name, fmt.Errorf("stage requirements not met: %w", err))
 				}
 			}
-			return nil
+
+			var outputMu sync.Mutex
+			return scheduleStages(stages, config.Stages, jobs, func(name string) error {
+				return executeStage(ctx, name, config.Stages[name], config, inRun, true, &outputMu, auditStore)
+			})
 		},
 	})
 

@@ -36,7 +36,7 @@ func (a AuditLog) generateFilename() string {
 	return fmt.Sprintf("%s-%s-%s.json",
 		a.Project,
 		a.Stage,
-		a.StartTime.Format("20060102-150405"),
+		a.StartTime.Format("20060102-150405.000000000"),
 	)
 }
 

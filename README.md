@@ -130,9 +130,11 @@ project:
     store: string     # "file" or "s3"
     path: string      # Directory for file store or S3 prefix
     s3bucket: string  # S3 bucket name if using S3
+runners:             # Optional alias to Docker image
+  - alpine: string
 stages:
   stage_name:        # Stage definition
-    runner: string   # Docker image to use
+    runner: string   # Alias or Docker image to use
     commands: []     # Commands to execute
     volumes: []      # Volume mounts
     environment: {}  # Environment variables
@@ -169,12 +171,30 @@ stages:
 
 Each stage can define:
 
-- `runner`: Docker image to use (e.g., "docker/library/golang:1.20-alpine3.17")
+- `runner`: Alias defined in `runners`, or a Docker image (e.g., "docker/library/golang:1.20-alpine3.17")
 - `commands`: List of commands to execute
 - `volumes`: List of volume mounts
 - `environment`: Map of environment variables
 - `requires`: List of stages that must complete successfully before this stage can run
 - `timeout`: Maximum execution time
+
+Define an image once under `runners` and use the alias in each stage. A runner that does not match an alias is still used as an image reference.
+
+```yaml
+runners:
+  - alpine: "docker/library/golang:1.20-alpine3.17"
+
+stages:
+  test:
+    runner: alpine
+```
+
+A mapping works the same way:
+
+```yaml
+runners:
+  alpine: "docker/library/golang:1.20-alpine3.17"
+```
 
 Example with stage dependencies:
 
@@ -219,7 +239,24 @@ gosonic run test
 gosonic build deploy
 ```
 
-Note: gosonic does not automatically run required stages. You must explicitly run stages in the correct order.
+Note: gosonic does not automatically run required stages. You must name every stage you want to run. With the default `--jobs 1`, list them in dependency order.
+
+### Parallel stages
+
+`--jobs` sets how many stages run at once. The default is 1, which runs the named stages in command-line order and checks `requires` against audit logs from earlier runs.
+
+```bash
+gosonic run --jobs 4 lint test build
+```
+
+When `--jobs` is greater than 1, gosonic schedules the stages you named:
+
+- A stage starts only after every `requires` entry from this same command has succeeded in this run.
+- A requirement that you did not name must already be recorded as successful in the audit log.
+- A failure does not start anything further. Stages that have already started are allowed to finish.
+- Output lines are prefixed with the stage name.
+
+Parallel stages still share the default `.` bind mount at `/workspace`. Do not run stages together when they write the same paths.
 
 ### Volume Mounts
 
@@ -296,7 +333,7 @@ You can override these defaults using the `volumes` and other configuration opti
 gosonic [global options] command [command options] [arguments...]
 
 COMMANDS:
-   run      Run one or more stages in sequence
+   run      Run one or more stages in order, or in parallel with --jobs
    help     Show help
    
 GLOBAL OPTIONS:

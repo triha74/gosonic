@@ -2,9 +2,11 @@ package lib
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -155,12 +157,14 @@ func ResolveRunnerImage(runner string, defaultRegistry string) string {
 
 // StageExecution represents the configuration needed to execute a stage
 type StageExecution struct {
-	Name        string
-	Runner      string
-	Commands    []string
-	Environment map[string]string
-	Volumes     []Volume
-	Verbose     bool // Add verbose flag
+	Name         string
+	Runner       string
+	Commands     []string
+	Environment  map[string]string
+	Volumes      []Volume
+	Verbose      bool
+	PrefixOutput bool        // Prefix each output line with the stage name
+	OutputLock   *sync.Mutex // Shared lock so parallel stages do not interleave lines
 }
 
 // ExecuteStage runs a stage in a docker container and handles audit logging
@@ -229,26 +233,25 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 
 	// Print the command only if verbose is enabled
 	if stage.Verbose {
-		fmt.Printf("Stage: %s\n", stage.Name)
-		fmt.Printf("Runner: %s\n", stage.Runner)
-		fmt.Printf("\nDocker command:\n%s\n", fullCommand)
+		stage.printf("Stage: %s\nRunner: %s\n\nDocker command:\n%s\n", stage.Name, stage.Runner, fullCommand)
 	}
 
-	// Create audit log
+	// Create audit log. Status stays "running" until the container exits so a
+	// concurrent stage cannot treat this record as a finished requirement.
 	auditLog := AuditLog{
 		Project:     projectName,
 		GitRevision: gitRev,
 		Stage:       stage.Name,
 		Command:     fullCommand,
 		StartTime:   startTime,
-		Status:      "success", // Will be updated if there's an error
+		Status:      "running",
 	}
 
 	// Write initial audit log
 	if auditStore != nil {
 		if err := auditStore.Store(auditLog); err != nil {
 			// Always print audit log errors, even in non-verbose mode
-			fmt.Printf("Error writing audit log: %v\n", err)
+			stage.printf("Error writing audit log: %v\n", err)
 		}
 	}
 
@@ -256,25 +259,69 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	result := ExecDocker(dockerArgs)
 
 	// Print output - always show command output regardless of verbose setting
-	if result.Stdout != "" {
-		fmt.Println(result.Stdout)
-	}
-	if result.Stderr != "" {
-		fmt.Printf("%s", result.Stderr)
-	}
+	stage.writeOutput(result.Stdout, result.Stderr)
 
-	// Update audit log if there was an error
+	auditLog.Duration = time.Since(startTime).Seconds()
 	if result.Error != nil {
 		auditLog.SetError(result.Error)
-		if auditStore != nil {
-			if err := auditStore.Store(auditLog); err != nil {
-				fmt.Printf("Error writing audit log: %v\n", err)
-			}
-		}
-		return result.Error
+	} else {
+		auditLog.Status = "success"
 	}
+	if auditStore != nil {
+		if err := auditStore.Store(auditLog); err != nil {
+			stage.printf("Error writing audit log: %v\n", err)
+		}
+	}
+	return result.Error
+}
 
-	return nil
+// printf writes a formatted message. Parallel stages share OutputLock and, when
+// requested, prefix each line with the stage name.
+func (stage StageExecution) printf(format string, args ...any) {
+	text := fmt.Sprintf(format, args...)
+	if stage.OutputLock != nil {
+		stage.OutputLock.Lock()
+		defer stage.OutputLock.Unlock()
+	}
+	if stage.PrefixOutput {
+		writePrefixed(os.Stdout, stage.Name, text)
+		return
+	}
+	fmt.Print(text)
+}
+
+// writeOutput prints command output. Sequential runs keep the historical
+// stdout/stderr formatting. Parallel runs prefix every line and share OutputLock
+// so stages do not interleave mid-line.
+func (stage StageExecution) writeOutput(stdout, stderr string) {
+	if stage.OutputLock != nil {
+		stage.OutputLock.Lock()
+		defer stage.OutputLock.Unlock()
+	}
+	if stage.PrefixOutput {
+		writePrefixed(os.Stdout, stage.Name, stdout)
+		writePrefixed(os.Stderr, stage.Name, stderr)
+		return
+	}
+	if stdout != "" {
+		fmt.Println(stdout)
+	}
+	if stderr != "" {
+		fmt.Printf("%s", stderr)
+	}
+}
+
+func writePrefixed(w io.Writer, name, text string) {
+	if text == "" {
+		return
+	}
+	lines := strings.Split(text, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	for _, line := range lines {
+		fmt.Fprintf(w, "%s | %s\n", name, line)
+	}
 }
 
 // splitCommandArgs splits a command string into arguments, respecting quotes

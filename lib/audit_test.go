@@ -68,6 +68,39 @@ func TestFileStore(t *testing.T) {
 	})
 }
 
+func TestFileStoreNanosecondFilenames(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir, false)
+	base := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+
+	first := AuditLog{
+		Project:     "app",
+		GitRevision: "abc",
+		Stage:       "build",
+		StartTime:   base.Add(time.Nanosecond),
+		Status:      "running",
+	}
+	second := AuditLog{
+		Project:     "app",
+		GitRevision: "abc",
+		Stage:       "build",
+		StartTime:   base.Add(2 * time.Nanosecond),
+		Status:      "running",
+	}
+
+	assert.NoError(t, store.Store(first))
+	assert.NoError(t, store.Store(second))
+
+	finished := first
+	finished.Status = "success"
+	assert.NoError(t, store.Store(finished))
+
+	entries, err := os.ReadDir(dir)
+	assert.NoError(t, err)
+	assert.Len(t, entries, 2)
+	assert.NotEqual(t, first.generateFilename(), second.generateFilename())
+}
+
 func TestS3Store(t *testing.T) {
 	mockClient := new(MockS3Client)
 	store := NewS3Store(mockClient, "test-bucket", "logs", false)
