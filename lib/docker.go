@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -540,7 +541,93 @@ func (stage StageExecution) invokeDocker(args []string) DockerResult {
 		return ExecDocker(args)
 	}
 	stdout, stderr := stage.consoleWriters()
-	return runDockerStreaming(ctx, args, stdout, stderr)
+	return runDockerContainer(ctx, args, stdout, stderr)
+}
+
+// runDockerContainer starts a docker run specification through create, start,
+// and logs --follow. Docker Desktop can drop output attached directly to
+// docker run, while the logs stream retains it. Creation failures, including
+// a denied workspace mount, stay captured so the caller can recover without
+// already having printed them.
+func runDockerContainer(ctx context.Context, args []string, stdout, stderr io.Writer) DockerResult {
+	if len(args) < 2 || args[0] != "docker" || args[1] != "run" {
+		return runDockerStreaming(ctx, args, stdout, stderr)
+	}
+
+	created := runDocker(ctx, dockerCreateArgs(args))
+	if created.Error != nil {
+		return created
+	}
+	id := strings.TrimSpace(created.Stdout)
+	if id == "" {
+		return DockerResult{
+			Error:    fmt.Errorf("docker create returned no container id"),
+			Stderr:   created.Stderr,
+			ExitCode: 1,
+		}
+	}
+	defer func() {
+		_ = runDocker(context.Background(), []string{"docker", "rm", "-f", id})
+	}()
+
+	if started := runDocker(ctx, []string{"docker", "start", id}); started.Error != nil {
+		return containerResult(ctx, started, false)
+	}
+	logs := runDockerStreaming(ctx, []string{"docker", "logs", "--follow", id}, stdout, stderr)
+	if ctx.Err() != nil {
+		return containerResult(ctx, logs, logs.Streamed)
+	}
+
+	inspected := runDocker(context.Background(), []string{"docker", "inspect", "-f", "{{.State.ExitCode}}", id})
+	if inspected.Error != nil {
+		if logs.Error != nil {
+			return logs
+		}
+		inspected.Stdout = logs.Stdout
+		inspected.Stderr = logs.Stderr
+		inspected.Streamed = logs.Streamed
+		return inspected
+	}
+	code, err := strconv.Atoi(strings.TrimSpace(inspected.Stdout))
+	if err != nil {
+		return DockerResult{
+			Stdout:   logs.Stdout,
+			Stderr:   logs.Stderr,
+			Error:    fmt.Errorf("reading container exit code: %w", err),
+			ExitCode: 1,
+			Streamed: logs.Streamed,
+		}
+	}
+	result := logs
+	result.ExitCode = code
+	result.Error = nil
+	if code != 0 {
+		result.Error = fmt.Errorf("exit status %d", code)
+	}
+	return result
+}
+
+func dockerCreateArgs(runArgs []string) []string {
+	createArgs := make([]string, 0, len(runArgs))
+	createArgs = append(createArgs, "docker", "create")
+	for _, arg := range runArgs[2:] {
+		if arg == "--rm" {
+			continue
+		}
+		createArgs = append(createArgs, arg)
+	}
+	return createArgs
+}
+
+func containerResult(ctx context.Context, result DockerResult, streamed bool) DockerResult {
+	result.Streamed = streamed
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		result.Error = fmt.Errorf("timed out: %w", ctx.Err())
+		if result.ExitCode == 0 {
+			result.ExitCode = 124
+		}
+	}
+	return result
 }
 
 func (stage StageExecution) consoleWriters() (io.Writer, io.Writer) {

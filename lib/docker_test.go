@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -552,6 +553,57 @@ func TestLinePrefixWriterSplitsChunks(t *testing.T) {
 	assert.Equal(t, "build | hello\n", buf.String())
 	w.Flush()
 	assert.Equal(t, "build | hello\nbuild | wor\n", buf.String())
+}
+
+func TestDockerCreateArgsDropsAutoRemove(t *testing.T) {
+	got := dockerCreateArgs([]string{"docker", "run", "--rm", "--init", "alpine", "echo", "hi"})
+	assert.Equal(t, []string{"docker", "create", "--init", "alpine", "echo", "hi"}, got)
+}
+
+func TestRunDockerContainerKeepsDelayedOutput(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is not available")
+	}
+
+	var stdout, stderr bytes.Buffer
+	result := runDockerContainer(context.Background(), []string{
+		"docker", "run", "--rm", "alpine:latest", "sh", "-c",
+		"echo line-1; echo warn-1 >&2; sleep 1; echo line-2; echo warn-2 >&2",
+	}, &stdout, &stderr)
+	assert.NoError(t, result.Error)
+	assert.Equal(t, 0, result.ExitCode)
+	assert.Equal(t, "line-1\nline-2\n", stdout.String())
+	assert.Equal(t, "warn-1\nwarn-2\n", stderr.String())
+	assert.True(t, result.Streamed)
+}
+
+func TestRunDockerContainerCapturesCreateFailure(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is not available")
+	}
+
+	var streamed bytes.Buffer
+	result := runDockerContainer(context.Background(), []string{
+		"docker", "run", "--rm", "--not-a-real-option", "alpine:latest", "echo", "hi",
+	}, &streamed, &streamed)
+	assert.Error(t, result.Error)
+	assert.False(t, result.Streamed)
+	assert.Empty(t, streamed.String())
+	assert.NotEmpty(t, result.Stderr)
+}
+
+func TestRunDockerContainerExitStatus(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is not available")
+	}
+
+	var stderr bytes.Buffer
+	result := runDockerContainer(context.Background(), []string{
+		"docker", "run", "--rm", "alpine:latest", "sh", "-c", "echo boom >&2; exit 7",
+	}, io.Discard, &stderr)
+	assert.Error(t, result.Error)
+	assert.Equal(t, 7, result.ExitCode)
+	assert.Equal(t, "boom\n", stderr.String())
 }
 
 func TestRunDockerStreamsBeforeExit(t *testing.T) {
