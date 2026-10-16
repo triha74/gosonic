@@ -274,8 +274,8 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 	// values) is visible. Sonic ${vars} are already resolved at load time.
 	if len(stage.Commands) == 1 && !strings.Contains(stage.Commands[0], "\n") {
 		dockerArgs = append(dockerArgs, splitCommandArgs(stage.Commands[0])...)
-	} else if len(stage.Commands) > 0 {
-		dockerArgs = append(dockerArgs, containerShell(stage.Shell), "-c", strings.Join(stage.Commands, " && "))
+	} else if script := joinShellCommands(stage.Commands); script != "" {
+		dockerArgs = append(dockerArgs, containerShell(stage.Shell), "-c", script)
 	}
 
 	// Quote arguments so the printed command is what the host would run.
@@ -426,6 +426,22 @@ func splitCommandArgs(cmd string) []string {
 	}
 
 	return args
+}
+
+// joinShellCommands chains stage commands with && in one shell.
+// YAML block scalars keep a trailing newline. Joining that raw string with
+// " && " puts the operator on the next line, which bash treats as a new
+// statement ("syntax error near unexpected token `&&'").
+func joinShellCommands(commands []string) string {
+	parts := make([]string, 0, len(commands))
+	for _, cmd := range commands {
+		cmd = strings.TrimRight(cmd, "\r\n")
+		if strings.TrimSpace(cmd) == "" {
+			continue
+		}
+		parts = append(parts, cmd)
+	}
+	return strings.Join(parts, " && ")
 }
 
 // containerShell is the program used for multiline or multi-command stages.

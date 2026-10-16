@@ -515,6 +515,30 @@ func TestShellCommandsKeepContainerVariables(t *testing.T) {
 	assert.Contains(t, got, "echo $shard && cargo test")
 }
 
+func TestMultilineCommandsJoinOnTheSameStatement(t *testing.T) {
+	original := ExecDocker
+	defer func() { ExecDocker = original }()
+	var got []string
+	ExecDocker = func(args []string) DockerResult {
+		got = append([]string{}, args...)
+		return DockerResult{}
+	}
+	err := ExecuteStage(StageExecution{
+		Name:   "clients",
+		Runner: "ubuntu:24.04",
+		Shell:  "bash",
+		Commands: []string{
+			"cargo build -p cypherlite-ffi",
+			"for src in *.c; do\n  cc \"$src\"\ndone\n",
+			"cd clients/javascript && npm test",
+		},
+	}, nil, "proj")
+	assert.NoError(t, err)
+	script := "cargo build -p cypherlite-ffi && for src in *.c; do\n  cc \"$src\"\ndone && cd clients/javascript && npm test"
+	assert.Contains(t, got, script)
+	assert.NoError(t, exec.Command("bash", "-n", "-c", script).Run())
+}
+
 func TestShellCommandsCanUseBash(t *testing.T) {
 	original := ExecDocker
 	defer func() { ExecDocker = original }()

@@ -12,7 +12,7 @@ Key distinctions:
 - **Task Executor, Not Pipeline Tool**: gosonic executes tasks within CI/CD pipelines rather than replacing the pipeline itself
 - **Docker-First Design**: All tasks run in isolated Docker containers, ensuring consistent execution environments
 - **Platform Agnostic**: Works identically across different CI/CD platforms (GitHub Actions, GitLab CI, Jenkins, etc.)
-- **Simple Configuration**: Uses a single YAML file to define execution stages and their environments
+- **Simple Configuration**: Each workflow is a YAML file under `.sonic/` that defines stages and their environments
 
 Think of gosonic as a more powerful, containerized alternative to Makefiles, bringing modern Docker-based isolation and configuration to task execution while maintaining compatibility with any CI/CD platform.
 
@@ -34,6 +34,7 @@ Think of gosonic as a more powerful, containerized alternative to Makefiles, bri
 3. [Configuration](#configuration)
    - [Project Configuration](#project-configuration)
    - [Stage Configuration](#stage-configuration)
+   - [Workflows](#workflows)
    - [Suites](#suites)
    - [Runner Configuration](#runner-configuration)
    - [Volume Configuration](#volume-configuration)
@@ -88,7 +89,7 @@ go install github.com/triha74/go-sonic@latest
 
 ## Quick Start
 
-1. Create a `.sonic.yml` file in your project root:
+1. Create `.sonic/ci.yml`:
 
 ```yaml
 version: "1"
@@ -114,7 +115,7 @@ stages:
 2. Run a stage:
 
 ```bash
-gosonic run test
+gosonic ci run test
 ```
 
 ## Configuration
@@ -227,20 +228,40 @@ When running a stage with dependencies:
 Example execution:
 ```bash
 # This will fail because 'test' hasn't run yet
-gosonic run build
+gosonic ci run build
 
 # This will work - run test first, then build
-gosonic run test  build
+gosonic ci run test build
 
 # This will fail because build hasn't run yet
-gosonic run deploy
+gosonic ci run deploy
 
-# This will work - run all stages in the correct order. Evalaution uses audit logs to determine if the stage has completed successfully.
-gosonic run test 
-gosonic build deploy
+# This will work - run all stages in the correct order. Evaluation uses audit logs to determine if the stage has completed successfully.
+gosonic ci run test
+gosonic ci run build deploy
 ```
 
 Note: gosonic does not automatically run required stages. You must name every stage you want to run. With the default `--jobs 1`, list them in dependency order.
+
+### Workflows
+
+A workflow is one file, `.sonic/<name>.yml`. The name is the word before `run`:
+
+```bash
+gosonic ci run --jobs 4 full-test
+gosonic ci run lint corpus
+gosonic --verbose ci run lint
+```
+
+`gosonic run full-test` uses the default file, in this order:
+
+1. `.sonic/sonic.yml`
+2. `.sonic.yml`
+3. the only `*.yml` in `.sonic/`
+
+Several workflow files and no `sonic.yml` require the name. `--sonic-file path.yml` selects that path and does not treat a leading word as a workflow. A workflow name is a single segment matching `[A-Za-z0-9_-]+`. `run`, `help`, and `verify-aws-creds` are commands, not workflow names.
+
+`gosonic ci lint` does not run the `lint` stage. The workflow name is only recognized when the next word is `run`.
 
 ### Suites
 
@@ -258,9 +279,9 @@ suites:
 ```
 
 ```bash
-gosonic run smoke-test
-gosonic run --jobs 4 full-test
-gosonic run lint smoke-test
+gosonic ci run smoke-test
+gosonic ci run --jobs 4 full-test
+gosonic ci run lint smoke-test
 ```
 
 A stage named by more than one argument is kept at its first position. With `--jobs` greater than 1, the expanded stages use the same dependency scheduler as a list of stage names.
@@ -270,7 +291,7 @@ A stage named by more than one argument is kept at its first position. With `--j
 `--jobs` sets how many stages run at once. The default is 1, which runs the named stages in command-line order and checks `requires` against audit logs from earlier runs.
 
 ```bash
-gosonic run --jobs 4 lint test build
+gosonic ci run --jobs 4 lint test build
 ```
 
 When `--jobs` is greater than 1, gosonic schedules the stages you named:
@@ -413,14 +434,16 @@ You can override these defaults using the `volumes` and other configuration opti
 ## Command Line Interface
 
 ```
-gosonic [global options] command [command options] [arguments...]
+gosonic [workflow] run [stages|suites]
+gosonic ci run --jobs 4 full-test
 
 COMMANDS:
-   run      Run one or more stages in order, or in parallel with --jobs
+   run      Run stages or suites. Example: gosonic ci run --jobs 4 full-test
    help     Show help
    
 GLOBAL OPTIONS:
-   --sonic-file value, -f value    Path to sonic configuration file (default: ".sonic.yml")
+   --sonic-file value, -f value    Path to a workflow file. Overrides the workflow name before run
+                                   (default: ".sonic/sonic.yml")
                                    Environment: SONIC_CONFIG_FILE
    
    --var value, -v value           Execution variables in key=value format (can be specified multiple times)
@@ -462,7 +485,7 @@ Example using environment variables:
 export SONIC_AUDIT_STORE=s3
 export SONIC_AUDIT_S3_BUCKET=my-audit-logs
 export SONIC_AUDIT_PATH=ci-logs/
-gosonic run build
+gosonic ci run build
 ```
 
 ## Execution Variables
@@ -471,10 +494,10 @@ You can pass variables to be used during stage execution using the `--var` flag.
 
 ```bash
 # Run deploy stage with specific region
-gosonic run deploy --var region.name=us-east-1
+gosonic ci run deploy --var region.name=us-east-1
 
 # Multiple variables can be specified
-gosonic run deploy --var region.name=us-east-1 --var env=prod
+gosonic ci run deploy --var region.name=us-east-1 --var env=prod
 ```
 
 ### Using Variables in Configuration
@@ -527,7 +550,7 @@ audit:
 2. Using command line flags or environment variables:
 ```bash
 # Using flags
-gosonic run build --audit-store=file --audit-path=.logs
+gosonic ci run build --audit-store=file --audit-path=.logs
 
 # Using environment variables
 export SONIC_AUDIT_STORE=s3
@@ -649,7 +672,7 @@ export AUDIT_LOG_AWS_PROFILE=audit-profile
 export AUDIT_LOG_AWS_REGION=us-west-2
 
 # Run gosonic with S3 audit logging
-gosonic run build --audit-store=s3 --audit-s3-bucket=my-audit-logs
+gosonic ci run build --audit-store=s3 --audit-s3-bucket=my-audit-logs
 ```
 
 Using explicit credentials:
@@ -660,7 +683,7 @@ export AUDIT_LOG_AWS_SECRET_ACCESS_KEY=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 export AUDIT_LOG_AWS_REGION=us-west-2
 
 # Run gosonic with S3 audit logging
-gosonic run build --audit-store=s3 --audit-s3-bucket=my-audit-logs
+gosonic ci run build --audit-store=s3 --audit-s3-bucket=my-audit-logs
 ```
 
 ### Configuration Priority
@@ -693,17 +716,17 @@ jobs:
           go install github.com/triha74/gosonic@latest
           
       - name: Run Tests
-        run: gosonic run test
+        run: gosonic ci run test
         
       - name: Build
-        run: gosonic run build
+        run: gosonic ci run build
         
       - name: Deploy (if main)
         if: github.ref == 'refs/heads/main'
         env:
           AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
-        run: gosonic run deploy
+        run: gosonic ci run deploy
 ```
 
 ### GitLab CI
@@ -722,12 +745,12 @@ before_script:
 test:
   stage: test
   script:
-    - gosonic run test
+    - gosonic ci run test
 
 build:
   stage: build
   script:
-    - gosonic run build
+    - gosonic ci run build
   artifacts:
     paths:
       - bin/
@@ -735,7 +758,7 @@ build:
 deploy:
   stage: deploy
   script:
-    - gosonic run deploy
+    - gosonic ci run deploy
   only:
     - main
   environment:
@@ -761,13 +784,13 @@ pipeline {
         
         stage('Test') {
             steps {
-                sh 'gosonic run test'
+                sh 'gosonic ci run test'
             }
         }
         
         stage('Build') {
             steps {
-                sh 'gosonic run build'
+                sh 'gosonic ci run build'
             }
         }
         
@@ -776,7 +799,7 @@ pipeline {
                 branch 'main'
             }
             steps {
-                sh 'gosonic run deploy'
+                sh 'gosonic ci run deploy'
             }
         }
     }
@@ -798,13 +821,13 @@ steps:
     command: 'get'
     arguments: 'github.com/triha74/gosonic@latest'
     
-- script: gosonic run test
+- script: gosonic ci run test
   displayName: 'Run Tests'
   
-- script: gosonic run build
+- script: gosonic ci run build
   displayName: 'Build'
   
-- script: gosonic run deploy
+- script: gosonic ci run deploy
   displayName: 'Deploy'
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
 ```
@@ -817,7 +840,7 @@ steps:
    - Consistent artifact outputs
 
 2. **Portable Configuration**
-   - Single `.sonic.yml` file defines all build stages
+   - Workflow files under `.sonic/` define the build stages
    - No need to duplicate build logic across different CI/CD configs
    - Easy to switch between CI/CD providers
 
@@ -866,7 +889,7 @@ stages:
 Each cell exports the dimension values as environment variables. Run a subset with `--matrix`:
 
 ```bash
-gosonic run deploy --matrix region=us-east-1,eu-west-1 --matrix environment=staging,production
+gosonic ci run deploy --matrix region=us-east-1,eu-west-1 --matrix environment=staging,production
 ```
 
 ### Security Considerations

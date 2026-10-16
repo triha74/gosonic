@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"gosonic/lib"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -61,19 +62,269 @@ const (
 	defaultAuditStore = "file"
 )
 
+// invocation is the config file and argv after a leading workflow name is applied.
+type invocation struct {
+	configPath string
+	workflow   string
+	args       []string
+}
+
 // resolveConfigPath returns an explicit --sonic-file path, or the first
 // default that exists. Help still advertises defaultConfigFile.
-func resolveConfigPath(explicit string) string {
+// With no sonic.yml, a single .sonic/*.yml is that workflow. Several files
+// and no sonic.yml is an error so the caller has to name one.
+func resolveConfigPath(explicit string) (string, error) {
 	if explicit != "" {
-		return explicit
+		return explicit, nil
 	}
 	if _, err := os.Stat(defaultConfigFile); err == nil {
-		return defaultConfigFile
+		return defaultConfigFile, nil
 	}
 	if _, err := os.Stat(legacyConfigFile); err == nil {
-		return legacyConfigFile
+		return legacyConfigFile, nil
 	}
-	return defaultConfigFile
+	names, err := listWorkflowNames()
+	if err != nil {
+		return "", err
+	}
+	switch len(names) {
+	case 0:
+		return defaultConfigFile, nil
+	case 1:
+		return workflowPath(names[0]), nil
+	default:
+		return "", multipleWorkflowsError(names)
+	}
+}
+
+// prepareInvocation selects .sonic/<workflow>.yml when the first positional
+// is a workflow name and the next one is run. --sonic-file wins and leaves
+// the workflow token in place. Built-in commands are never workflow names.
+func prepareInvocation(args []string) (invocation, error) {
+	if len(args) == 0 {
+		args = []string{"gosonic"}
+	}
+	if explicit := explicitSonicFile(args); explicit != "" {
+		return invocation{configPath: explicit, args: args}, nil
+	}
+	positionals := positionalArgs(args)
+	if len(positionals) > 0 && !builtinCommand(positionals[0]) {
+		name := positionals[0]
+		followedByRun := len(positionals) > 1 && positionals[1] == "run"
+		if followedByRun {
+			if !validWorkflowName(name) {
+				return invocation{}, fmt.Errorf("invalid workflow name %q", name)
+			}
+			path := workflowPath(name)
+			if _, err := os.Stat(path); err != nil {
+				return invocation{}, unknownWorkflowError(name)
+			}
+			return invocation{
+				configPath: path,
+				workflow:   name,
+				args:       stripFirstPositional(args),
+			}, nil
+		}
+		if validWorkflowName(name) {
+			if _, err := os.Stat(workflowPath(name)); err == nil {
+				return invocation{}, workflowRunHint(name, positionals[1:])
+			}
+		}
+	}
+	path, err := resolveConfigPath("")
+	if err != nil {
+		return invocation{}, err
+	}
+	return invocation{configPath: path, args: args}, nil
+}
+
+func workflowPath(name string) string {
+	return filepath.Join(".sonic", name+".yml")
+}
+
+func validWorkflowName(name string) bool {
+	if name == "" || builtinCommand(name) {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func builtinCommand(name string) bool {
+	switch name {
+	case "run", "help", "verify-aws-creds":
+		return true
+	default:
+		return false
+	}
+}
+
+func listWorkflowNames() ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(".sonic", "*.yml"))
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(matches))
+	for _, match := range matches {
+		names = append(names, strings.TrimSuffix(filepath.Base(match), ".yml"))
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func multipleWorkflowsError(names []string) error {
+	var b strings.Builder
+	b.WriteString("several workflows in .sonic/; name one before run:")
+	for _, name := range names {
+		fmt.Fprintf(&b, "\n  %s", name)
+	}
+	return fmt.Errorf("%s", b.String())
+}
+
+func unknownWorkflowError(name string) error {
+	names, err := listWorkflowNames()
+	if err != nil {
+		return err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "unknown workflow %q", name)
+	if len(names) == 0 {
+		b.WriteString("\nno workflows in .sonic/")
+	} else {
+		b.WriteString("\nworkflows in .sonic/:")
+		for _, workflow := range names {
+			fmt.Fprintf(&b, "\n  %s", workflow)
+		}
+	}
+	return fmt.Errorf("%s", b.String())
+}
+
+func workflowRunHint(name string, rest []string) error {
+	cmd := "gosonic " + name + " run"
+	if len(rest) > 0 {
+		cmd += " " + strings.Join(rest, " ")
+	}
+	return fmt.Errorf("did you mean: %s", cmd)
+}
+
+// workflowLabel names the loaded file in help and errors.
+// A file under .sonic/ is "workflow ci (.sonic/ci.yml)".
+func workflowLabel(name, path string) string {
+	if path == "" {
+		return ""
+	}
+	if name == "" && filepath.Dir(path) == ".sonic" {
+		name = strings.TrimSuffix(filepath.Base(path), ".yml")
+	}
+	if name == "" {
+		return path
+	}
+	return fmt.Sprintf("workflow %s (%s)", name, path)
+}
+
+func explicitSonicFile(args []string) string {
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if strings.HasPrefix(arg, "--sonic-file=") {
+			return strings.TrimPrefix(arg, "--sonic-file=")
+		}
+		takesValue, known := globalFlag(arg)
+		if !known {
+			continue
+		}
+		if takesValue && !strings.Contains(arg, "=") {
+			if i+1 >= len(args) {
+				return ""
+			}
+			if arg == "--sonic-file" || arg == "-f" {
+				return args[i+1]
+			}
+			i++
+		}
+	}
+	return ""
+}
+
+func positionalArgs(args []string) []string {
+	var out []string
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			out = append(out, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(arg, "-") {
+			takesValue, known := globalFlag(arg)
+			if known && takesValue && !strings.Contains(arg, "=") {
+				i++
+			}
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func stripFirstPositional(args []string) []string {
+	out := make([]string, 0, len(args))
+	if len(args) > 0 {
+		out = append(out, args[0])
+	}
+	dropped := false
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			rest := args[i+1:]
+			if !dropped && len(rest) > 0 {
+				out = append(out, "--")
+				out = append(out, rest[1:]...)
+				return out
+			}
+			out = append(out, args[i:]...)
+			return out
+		}
+		if strings.HasPrefix(arg, "-") {
+			out = append(out, arg)
+			takesValue, known := globalFlag(arg)
+			if known && takesValue && !strings.Contains(arg, "=") && i+1 < len(args) {
+				i++
+				out = append(out, args[i])
+			}
+			continue
+		}
+		if !dropped {
+			dropped = true
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+// globalFlag reports whether arg is a gosonic global flag and whether the
+// next argv element is its value. Attached --flag=value forms take no extra
+// element. Command flags such as --jobs are not global.
+func globalFlag(arg string) (takesValue, known bool) {
+	switch arg {
+	case "--verbose", "--help", "-h":
+		return false, true
+	case "--sonic-file", "-f", "--var", "-v", "--audit-store", "--audit-path", "--audit-s3-bucket", "--registry":
+		return true, true
+	default:
+		if strings.HasPrefix(arg, "--sonic-file=") {
+			return false, true
+		}
+		return false, false
+	}
 }
 
 // defaultCreateAuditStore creates the appropriate audit store based on configuration
@@ -826,11 +1077,28 @@ func formatStageHelp(suites map[string][]string, stages map[string]Stage) string
 	return b.String()
 }
 
+func joinHelp(label, body string) string {
+	if label == "" {
+		return body
+	}
+	if body == "" {
+		return label
+	}
+	return label + "\n\n" + body
+}
+
 func run(args []string) error {
 	cliApp := cli.NewApp()
 	cliApp.Name = "gosonic"
-	cliApp.Usage = "A build tool for CI/CD pipelines"
-	cliApp.Description = "Gosonic provides a unified way to build, test, package and deploy applications"
+	cliApp.Usage = "Run stages from a workflow file"
+	cliApp.UsageText = "gosonic [workflow] run [stages|suites]\n   gosonic ci run --jobs 4 full-test"
+	cliApp.Description = strings.TrimSpace(`
+A workflow is .sonic/<name>.yml. Put that name before run:
+
+   gosonic ci run --jobs 4 full-test
+
+With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.yml in .sonic/. Several workflow files and no sonic.yml require the name. --sonic-file selects a path and leaves a workflow name unused.
+`)
 
 	// Global flags
 	cliApp.Flags = []cli.Flag{
@@ -838,7 +1106,7 @@ func run(args []string) error {
 			Name:    "sonic-file",
 			Aliases: []string{"f"},
 			Value:   defaultConfigFile,
-			Usage:   "Path to sonic configuration file",
+			Usage:   "Path to a workflow file. Overrides the workflow name before run",
 			EnvVars: []string{"SONIC_CONFIG_FILE"},
 		},
 		&cli.StringSliceFlag{
@@ -876,16 +1144,20 @@ func run(args []string) error {
 		},
 	}
 
-	// Load config and create commands immediately
-	var configPath string
+	// Load config and create commands immediately. A leading workflow name is
+	// removed here so urfave sees `run` and help is built from that file.
+	inv, invErr := prepareInvocation(args)
+	if invErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", invErr)
+		if os.Getenv("GO_TEST") != "1" {
+			os.Exit(1)
+		}
+		return invErr
+	}
+	args = inv.args
+	configPath := inv.configPath
 	var vars execVars
 	for i, arg := range args {
-		if (arg == "--sonic-file" || arg == "-f") && i+1 < len(args) {
-			configPath = args[i+1]
-		}
-		if strings.HasPrefix(arg, "--sonic-file=") {
-			configPath = strings.TrimPrefix(arg, "--sonic-file=")
-		}
 		if arg == "--var" && i+1 < len(args) {
 			if vars == nil {
 				vars = make(execVars)
@@ -896,7 +1168,7 @@ func run(args []string) error {
 			}
 		}
 	}
-	configPath = resolveConfigPath(configPath)
+	loadedFrom := workflowLabel(inv.workflow, configPath)
 
 	// Start with built-in commands
 	commands := []*cli.Command{
@@ -925,8 +1197,8 @@ func run(args []string) error {
 	// Add the run command after config is loaded
 	commands = append(commands, &cli.Command{
 		Name:        "run",
-		Usage:       "Run one or more stages in order, or in parallel with --jobs",
-		Description: formatStageHelp(config.Suites, config.Stages),
+		Usage:       "Run stages or suites. Example: gosonic ci run --jobs 4 full-test",
+		Description: joinHelp(loadedFrom, formatStageHelp(config.Suites, config.Stages)),
 		Flags: []cli.Flag{
 			&cli.IntFlag{
 				Name:    "jobs",
@@ -954,6 +1226,9 @@ func run(args []string) error {
 			stages, err := expandRunTargets(ctx.Args().Slice(), config.Suites, config.Stages)
 			if err != nil {
 				if unknown, ok := err.(unknownTargetsError); ok {
+					if loadedFrom != "" {
+						fmt.Fprintln(os.Stderr, loadedFrom)
+					}
 					fmt.Fprintf(os.Stderr, "Error: invalid stage(s): %s\n\n", strings.Join(unknown.names, ", "))
 					if len(config.Suites) > 0 {
 						fmt.Fprintf(os.Stderr, "Available suites:\n")
@@ -984,13 +1259,16 @@ func run(args []string) error {
 			}
 
 			gate := &actionOnce{}
-			progressSet := lib.NewProgressSet(ctx.Bool("verbose"), jobs > 1)
+			progressSet := lib.NewProgressSet(ctx.Bool("verbose"), jobs > 1, runNames...)
+			var runErr error
+			defer func() { progressSet.Summarize(runErr) }()
 			defer progressSet.Close()
 			// jobs == 1 keeps command-line order and does not use the scheduler.
 			if jobs == 1 {
 				for _, name := range runNames {
 					if err := runConfiguredStage(ctx, name, runStages[name], config, nil, false, nil, nil, gate, progressSet, nil); err != nil {
-						return fmt.Errorf("stage %q failed: %w", name, err)
+						runErr = fmt.Errorf("stage %q failed: %w", name, err)
+						return runErr
 					}
 				}
 				return nil
@@ -1003,7 +1281,8 @@ func run(args []string) error {
 
 			auditStore, err := createAuditStore(config, ctx)
 			if err != nil {
-				return fmt.Errorf("creating audit store: %w", err)
+				runErr = fmt.Errorf("creating audit store: %w", err)
+				return runErr
 			}
 			gitRev, err := getGitRevision()
 			if err != nil {
@@ -1011,14 +1290,16 @@ func run(args []string) error {
 			}
 			for _, name := range runNames {
 				if err := verifyRequirements(withoutRequires(runStages[name], inRun), auditStore, config.Project.Name, gitRev); err != nil {
-					return fmt.Errorf("stage %q failed: %w", name, fmt.Errorf("stage requirements not met: %w", err))
+					runErr = fmt.Errorf("stage %q failed: %w", name, fmt.Errorf("stage requirements not met: %w", err))
+					return runErr
 				}
 			}
 
 			var outputMu sync.Mutex
-			return scheduleStages(runNames, runStages, jobs, func(runCtx context.Context, name string) error {
+			runErr = scheduleStages(runNames, runStages, jobs, func(runCtx context.Context, name string) error {
 				return runConfiguredStage(ctx, name, runStages[name], config, inRun, true, &outputMu, auditStore, gate, progressSet, runCtx)
 			})
+			return runErr
 		},
 	})
 

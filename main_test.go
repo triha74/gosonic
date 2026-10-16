@@ -101,15 +101,195 @@ func TestResolveConfigPath(t *testing.T) {
 	assert.NoError(t, os.Chdir(dir))
 	t.Cleanup(func() { _ = os.Chdir(wd) })
 
-	assert.Equal(t, defaultConfigFile, resolveConfigPath(""))
-	assert.Equal(t, "custom.yml", resolveConfigPath("custom.yml"))
+	got, err := resolveConfigPath("")
+	assert.NoError(t, err)
+	assert.Equal(t, defaultConfigFile, got)
+	got, err = resolveConfigPath("custom.yml")
+	assert.NoError(t, err)
+	assert.Equal(t, "custom.yml", got)
 
 	assert.NoError(t, os.WriteFile(legacyConfigFile, []byte("legacy: true"), 0644))
-	assert.Equal(t, legacyConfigFile, resolveConfigPath(""))
+	got, err = resolveConfigPath("")
+	assert.NoError(t, err)
+	assert.Equal(t, legacyConfigFile, got)
 
 	assert.NoError(t, os.MkdirAll(".sonic", 0755))
 	assert.NoError(t, os.WriteFile(defaultConfigFile, []byte("nested: true"), 0644))
-	assert.Equal(t, defaultConfigFile, resolveConfigPath(""))
+	got, err = resolveConfigPath("")
+	assert.NoError(t, err)
+	assert.Equal(t, defaultConfigFile, got)
+}
+
+func TestResolveConfigPathChoosesTheOnlyWorkflow(t *testing.T) {
+	wd, err := os.Getwd()
+	assert.NoError(t, err)
+	assert.NoError(t, os.Chdir(t.TempDir()))
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	assert.NoError(t, os.MkdirAll(".sonic", 0755))
+	assert.NoError(t, os.WriteFile(filepath.Join(".sonic", "ci.yml"), []byte("ci: true"), 0644))
+	got, err := resolveConfigPath("")
+	assert.NoError(t, err)
+	assert.Equal(t, filepath.Join(".sonic", "ci.yml"), got)
+
+	assert.NoError(t, os.WriteFile(filepath.Join(".sonic", "release.yml"), []byte("release: true"), 0644))
+	_, err = resolveConfigPath("")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "several workflows")
+	assert.Contains(t, err.Error(), "\n  ci\n")
+	assert.Contains(t, err.Error(), "\n  release")
+
+	assert.NoError(t, os.WriteFile(defaultConfigFile, []byte("nested: true"), 0644))
+	got, err = resolveConfigPath("")
+	assert.NoError(t, err)
+	assert.Equal(t, defaultConfigFile, got)
+}
+
+func TestWorkflowCommand(t *testing.T) {
+	wd, err := os.Getwd()
+	assert.NoError(t, err)
+	assert.NoError(t, os.Chdir(t.TempDir()))
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	assert.NoError(t, os.MkdirAll(".sonic", 0755))
+	ciYAML := []byte(`
+version: "1"
+project:
+  name: demo
+stages:
+  lint:
+    runner: alpine
+    commands: ["echo from-ci"]
+suites:
+  smoke:
+    - lint
+`)
+	releaseYAML := []byte(`
+version: "1"
+project:
+  name: demo
+stages:
+  ship:
+    runner: alpine
+    commands: ["echo from-release"]
+`)
+	assert.NoError(t, os.WriteFile(filepath.Join(".sonic", "ci.yml"), ciYAML, 0644))
+	assert.NoError(t, os.WriteFile(filepath.Join(".sonic", "release.yml"), releaseYAML, 0644))
+
+	inv, err := prepareInvocation([]string{"gosonic", "--verbose", "ci", "run", "--jobs", "4", "lint"})
+	assert.NoError(t, err)
+	assert.Equal(t, "ci", inv.workflow)
+	assert.Equal(t, filepath.Join(".sonic", "ci.yml"), inv.configPath)
+	assert.Equal(t, []string{"gosonic", "--verbose", "run", "--jobs", "4", "lint"}, inv.args)
+
+	other := filepath.Join(t.TempDir(), "other.yml")
+	assert.NoError(t, os.WriteFile(other, []byte(`
+version: "1"
+project:
+  name: other
+stages:
+  lint:
+    runner: alpine
+    commands: ["echo from-file"]
+`), 0644))
+	inv, err = prepareInvocation([]string{"gosonic", "--sonic-file", other, "ci", "run", "lint"})
+	assert.NoError(t, err)
+	assert.Empty(t, inv.workflow)
+	assert.Equal(t, other, inv.configPath)
+	assert.Equal(t, []string{"gosonic", "--sonic-file", other, "ci", "run", "lint"}, inv.args)
+
+	original := lib.ExecDocker
+	t.Cleanup(func() { lib.ExecDocker = original })
+	var mu sync.Mutex
+	var ran []string
+	lib.ExecDocker = func(args []string) lib.DockerResult {
+		joined := strings.Join(args, " ")
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.Contains(joined, "from-ci"):
+			ran = append(ran, "ci")
+		case strings.Contains(joined, "from-release"):
+			ran = append(ran, "release")
+		case strings.Contains(joined, "from-file"):
+			ran = append(ran, "file")
+		}
+		return lib.DockerResult{}
+	}
+	t.Setenv("GO_TEST", "1")
+
+	_, stderr, err := captureOutput(func() error {
+		return run([]string{"gosonic", "ci", "run", "lint"})
+	})
+	assert.NoError(t, err, stderr)
+	assert.Equal(t, []string{"ci"}, ran)
+
+	_, stderr, err = captureOutput(func() error {
+		return run([]string{"gosonic", "nightly", "run", "lint"})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, stderr, `unknown workflow "nightly"`)
+	assert.Contains(t, stderr, "\n  ci\n")
+	assert.Contains(t, stderr, "\n  release")
+
+	_, stderr, err = captureOutput(func() error {
+		return run([]string{"gosonic", "ci", "lint"})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, stderr, "did you mean: gosonic ci run lint")
+
+	_, stderr, err = captureOutput(func() error {
+		return run([]string{"gosonic", "ci"})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, stderr, "did you mean: gosonic ci run\n")
+
+	_, stderr, err = captureOutput(func() error {
+		return run([]string{"gosonic", "ci.yml", "run", "lint"})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, stderr, `invalid workflow name "ci.yml"`)
+
+	helpOut, _, helpErr := captureOutput(func() error {
+		return run([]string{"gosonic", "ci", "run", "--help"})
+	})
+	assert.NoError(t, helpErr)
+	assert.Contains(t, helpOut, "workflow ci (.sonic/ci.yml)")
+	assert.Contains(t, helpOut, "smoke")
+	assert.Contains(t, helpOut, "lint")
+
+	_, stderr, err = captureOutput(func() error {
+		return run([]string{"gosonic", "ci", "run", "missing"})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, stderr, "workflow ci (.sonic/ci.yml)")
+	assert.Contains(t, stderr, "invalid stage(s): missing")
+
+	_, stderr, err = captureOutput(func() error {
+		return run([]string{"gosonic", "run", "lint"})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, stderr, "several workflows in .sonic/; name one before run:")
+	assert.Contains(t, stderr, "\n  ci\n")
+	assert.Contains(t, stderr, "\n  release")
+
+	assert.NoError(t, os.Remove(filepath.Join(".sonic", "release.yml")))
+	mu.Lock()
+	ran = nil
+	mu.Unlock()
+	_, stderr, err = captureOutput(func() error {
+		return run([]string{"gosonic", "run", "lint"})
+	})
+	assert.NoError(t, err, stderr)
+	assert.Equal(t, []string{"ci"}, ran)
+
+	mu.Lock()
+	ran = nil
+	mu.Unlock()
+	_, stderr, err = captureOutput(func() error {
+		return run([]string{"gosonic", "--sonic-file", other, "run", "lint"})
+	})
+	assert.NoError(t, err, stderr)
+	assert.Equal(t, []string{"file"}, ran)
 }
 
 func TestRunnerAliases(t *testing.T) {
@@ -460,6 +640,7 @@ stages:
 	assert.Error(t, err)
 	assert.Contains(t, stdout, "link-check")
 	assert.Contains(t, stdout, "failed")
+	assert.Regexp(t, `(?m)^run\s+failed\s+\d+\.\d+s$`, stdout)
 	assert.NotContains(t, stdout, "\r")
 	assert.Contains(t, stderr, "Root dir must be an absolute path: 'docs'")
 	assert.Contains(t, stderr, `Error: stage "link-check" failed`)
@@ -526,9 +707,10 @@ stages:
 		})
 	})
 	assert.NoError(t, err, stderr)
-	assert.Contains(t, stdout, "lint | ok")
-	assert.Contains(t, stdout, "unit-test | ok")
-	assert.Contains(t, stdout, "build | ok")
+	assert.Regexp(t, `(?m)^lint\s+\| ok\s+\d+\.\d+s$`, stdout)
+	assert.Regexp(t, `(?m)^unit-test \| ok\s+\d+\.\d+s$`, stdout)
+	assert.Regexp(t, `(?m)^build\s+\| ok\s+\d+\.\d+s$`, stdout)
+	assert.Regexp(t, `(?m)^run\s+\| ok\s+\d+\.\d+s$`, stdout)
 	assert.NotContains(t, stdout, "lint ok")
 	assert.NotContains(t, stdout, "Tests passed")
 	assert.NotContains(t, stdout, "\r")
@@ -905,7 +1087,10 @@ stages:
 
 	// Verify usage information
 	assert.Contains(t, stdout, "NAME:")
-	assert.Contains(t, stdout, "gosonic - A build tool for CI/CD pipelines")
+	assert.Contains(t, stdout, "gosonic - Run stages from a workflow file")
+	assert.Contains(t, stdout, "gosonic [workflow] run [stages|suites]")
+	assert.Contains(t, stdout, "gosonic ci run --jobs 4 full-test")
+	assert.Contains(t, stdout, ".sonic/<name>.yml")
 	assert.Contains(t, stdout, "USAGE:")
 	assert.Contains(t, stdout, "COMMANDS:")
 	assert.Contains(t, stdout, "GLOBAL OPTIONS:")
