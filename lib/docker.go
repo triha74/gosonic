@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -221,6 +225,49 @@ func ResolveRunnerImage(runner string, defaultRegistry string) string {
 	return ref.String()
 }
 
+var builtinRegistries = []string{"docker.io", "public.ecr.aws", "ghcr.io", "quay.io", "localhost"}
+
+var warnedDigests sync.Map
+
+// RegistryAllowed reports whether host may be used as an image registry.
+// extra lists workflow-configured registries. A port is ignored when the hostname is allowed.
+func RegistryAllowed(host string, extra []string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	name := host
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		name = parsed
+	}
+	for _, allowed := range append(append([]string{}, builtinRegistries...), extra...) {
+		allowed = strings.ToLower(strings.TrimSpace(allowed))
+		if allowed == "" {
+			continue
+		}
+		if host == allowed || name == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateImage rejects registries outside the allowlist.
+// Images without a digest warn, or fail when requireDigest is set.
+func ValidateImage(image string, extra []string, requireDigest bool) error {
+	ref := ParseImageRef(image)
+	if ref.Domain == "" || !RegistryAllowed(ref.Domain, extra) {
+		return fmt.Errorf("registry %q is not allowed for image %s", ref.Domain, image)
+	}
+	if ref.Digest != "" {
+		return nil
+	}
+	if requireDigest {
+		return fmt.Errorf("image %s has no @sha256 digest", image)
+	}
+	if _, loaded := warnedDigests.LoadOrStore(image, true); !loaded {
+		fmt.Fprintf(os.Stderr, "warning: image %s has no @sha256 digest\n", image)
+	}
+	return nil
+}
+
 // ServiceSpec is a container started beside a stage and removed afterwards.
 type ServiceSpec struct {
 	Name        string
@@ -231,24 +278,31 @@ type ServiceSpec struct {
 
 // StageExecution represents the configuration needed to execute a stage
 type StageExecution struct {
-	Name             string
-	Runner           string
-	Commands         []string
-	Shell            string
-	Environment      map[string]string
-	Volumes          []Volume
-	Verbose          bool
-	PrefixOutput     bool
-	OutputLock       *sync.Mutex
-	WorkingDirectory string
-	Timeout          time.Duration
-	DockerSocket     bool
-	Services         []ServiceSpec
-	Context          context.Context
+	Name              string
+	Runner            string
+	Commands          []string
+	Shell             string
+	Environment       map[string]string
+	Volumes           []Volume
+	Verbose           bool
+	PrefixOutput      bool
+	OutputLock        *sync.Mutex
+	WorkingDirectory  string
+	Timeout           time.Duration
+	DockerSocket      bool
+	AllowDockerSocket bool
+	Secrets           []string
+	User              string
+	PidsLimit         int
+	Services          []ServiceSpec
+	Context           context.Context
 }
 
 // ExecuteStage runs a stage in a docker container and handles audit logging
 func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName string) error {
+	if stage.DockerSocket && !stage.AllowDockerSocket {
+		return fmt.Errorf("docker socket is not allowed; pass --allow-docker-socket or set GOSONIC_ALLOW_DOCKER_SOCKET=1")
+	}
 	startTime := time.Now()
 
 	// Get git revision
@@ -257,21 +311,28 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 		gitRev = "unknown" // Don't fail if we can't get git revision
 	}
 
+	envFile, err := writeEnvFile(stage.Environment, stage.Secrets)
+	if err != nil {
+		return err
+	}
+	if envFile != "" {
+		defer os.Remove(envFile)
+	}
+
 	network, cleanup, err := startServices(stage)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	dockerArgs, err := buildDockerArgs(stage, network)
+	dockerArgs, err := buildDockerArgs(stage, network, envFile)
 	if err != nil {
 		return err
 	}
 
 	// A single simple command is the container entrypoint. Multiple commands,
-	// or a command that needs a shell, run under <shell> -c. Variable expansion
-	// happens in that shell so container environment (including matrix
-	// values) is visible. Sonic ${vars} are already resolved at load time.
+	// or a command that needs a shell, run under <shell> -c. The shell expands
+	// container environment, including matrix values and --var names.
 	if len(stage.Commands) == 1 && !strings.Contains(stage.Commands[0], "\n") {
 		dockerArgs = append(dockerArgs, splitCommandArgs(stage.Commands[0])...)
 	} else if script := joinShellCommands(stage.Commands); script != "" {
@@ -453,26 +514,33 @@ func containerShell(name string) string {
 	return name
 }
 
-func buildDockerArgs(stage StageExecution, network string) ([]string, error) {
+func buildDockerArgs(stage StageExecution, network, envFile string) ([]string, error) {
+	if stage.DockerSocket && !stage.AllowDockerSocket {
+		return nil, fmt.Errorf("docker socket is not allowed; pass --allow-docker-socket or set GOSONIC_ALLOW_DOCKER_SOCKET=1")
+	}
 	workdir := stage.WorkingDirectory
 	if workdir == "" {
 		workdir = "/workspace"
 	}
+	user, groups := containerIdentity(stage)
 	dockerArgs := []string{
 		"docker", "run",
 		"--rm",
 		"--init",
 		"--workdir", workdir,
+		"--user", user,
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges",
+		"--pids-limit", pidsLimit(stage),
+	}
+	for _, gid := range groups {
+		dockerArgs = append(dockerArgs, "--group-add", gid)
 	}
 	if network != "" {
 		dockerArgs = append(dockerArgs, "--network", network)
 	}
-
-	for k, v := range stage.Environment {
-		dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", k, v))
-		if val, exists := os.LookupEnv(v); exists {
-			dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", v, val))
-		}
+	if envFile != "" {
+		dockerArgs = append(dockerArgs, "--env-file", envFile)
 	}
 
 	volumes := append([]Volume{}, stage.Volumes...)
@@ -483,7 +551,22 @@ func buildDockerArgs(stage StageExecution, network string) ([]string, error) {
 			Target: "/var/run/docker.sock",
 		})
 	}
+	var readonly []Volume
 	for _, vol := range volumes {
+		if (vol.Type == "" || vol.Type == "bind") && isWorkspaceBind(vol.Source) {
+			readonly = append(readonly, readonlyMetadataMounts(vol.Source, vol.Target)...)
+		}
+	}
+	volumes = append(volumes, readonly...)
+
+	_, keyPath, err := loadAuditKey()
+	if err != nil {
+		return nil, err
+	}
+	for _, vol := range volumes {
+		if (vol.Type == "" || vol.Type == "bind") && mountsAuditKey(vol.Source, keyPath) {
+			return nil, fmt.Errorf("refusing to mount %s: it includes the audit signing key", vol.Source)
+		}
 		arg, err := vol.dockerVolumeArg()
 		if err != nil {
 			return nil, err
@@ -493,6 +576,172 @@ func buildDockerArgs(stage StageExecution, network string) ([]string, error) {
 
 	dockerArgs = append(dockerArgs, stage.Runner)
 	return dockerArgs, nil
+}
+
+func pidsLimit(stage StageExecution) string {
+	if stage.PidsLimit > 0 {
+		return strconv.Itoa(stage.PidsLimit)
+	}
+	return "4096"
+}
+
+func containerIdentity(stage StageExecution) (string, []string) {
+	user := stage.User
+	if user == "" {
+		user = fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	}
+	var groups []string
+	if stage.DockerSocket && stage.AllowDockerSocket {
+		if gid, err := dockerSocketGroup(); err == nil && gid != "" {
+			groups = append(groups, gid)
+		}
+	}
+	return user, groups
+}
+
+func dockerSocketGroup() (string, error) {
+	info, err := os.Stat("/var/run/docker.sock")
+	if err != nil {
+		return "", err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("docker socket has no owner")
+	}
+	return strconv.FormatUint(uint64(stat.Gid), 10), nil
+}
+
+func isWorkspaceBind(source string) bool {
+	if source == "." || source == "./" {
+		return true
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	abs, err := filepath.Abs(source)
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(abs) == filepath.Clean(cwd)
+}
+
+func readonlyMetadataMounts(source, target string) []Volume {
+	abs, err := filepath.Abs(source)
+	if err != nil {
+		return nil
+	}
+	var mounts []Volume
+	for _, name := range []string{".git", ".sonic"} {
+		host := filepath.Join(abs, name)
+		if _, err := os.Lstat(host); err != nil {
+			continue
+		}
+		mounts = append(mounts, Volume{
+			Type:     "bind",
+			Source:   host,
+			Target:   strings.TrimRight(target, "/") + "/" + name,
+			Readonly: true,
+		})
+	}
+	return mounts
+}
+
+// mountsAuditKey reports whether a bind of source would expose the signing key.
+// A mount of the key file, its directory, or any parent directory counts.
+func mountsAuditKey(source, keyPath string) bool {
+	if source == "" || keyPath == "" {
+		return false
+	}
+	src, err := filepath.Abs(source)
+	if err != nil {
+		return false
+	}
+	key, err := filepath.Abs(keyPath)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(src), filepath.Clean(key))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+func writeEnvFile(env map[string]string, secrets []string) (string, error) {
+	merged := make(map[string]string, len(env)+len(secrets))
+	for key, value := range env {
+		if ProtectedEnv(key) {
+			continue
+		}
+		merged[key] = value
+	}
+	for _, name := range secrets {
+		if name == "" {
+			return "", fmt.Errorf("secret name is empty")
+		}
+		if ProtectedEnv(name) {
+			continue
+		}
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			return "", fmt.Errorf("secret %s is not set in the environment", name)
+		}
+		merged[name] = value
+	}
+	if len(merged) == 0 {
+		return "", nil
+	}
+	keys := make([]string, 0, len(merged))
+	for key := range merged {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var body strings.Builder
+	for _, key := range keys {
+		body.WriteString(envFileLine(key, merged[key]))
+		body.WriteByte('\n')
+	}
+	file, err := os.CreateTemp("", "gosonic-env-*")
+	if err != nil {
+		return "", fmt.Errorf("creating env file: %w", err)
+	}
+	path := file.Name()
+	if err := file.Chmod(0600); err != nil {
+		file.Close()
+		os.Remove(path)
+		return "", err
+	}
+	if _, err := file.WriteString(body.String()); err != nil {
+		file.Close()
+		os.Remove(path)
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+func envFileLine(key, value string) string {
+	if value == "" || strings.ContainsAny(value, "\r\n\"'\\ #") || strings.TrimSpace(value) != value {
+		escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`).Replace(value)
+		return key + `="` + escaped + `"`
+	}
+	return key + "=" + value
+}
+
+func publishedPort(spec string) string {
+	spec = strings.TrimSpace(spec)
+	if spec == "" || strings.HasPrefix(spec, "[") {
+		return spec
+	}
+	parts := strings.Split(spec, ":")
+	if len(parts) >= 3 || (len(parts) == 2 && strings.Contains(parts[0], ".")) {
+		return spec
+	}
+	return "127.0.0.1:" + spec
 }
 
 func (v Volume) dockerVolumeArg() (string, error) {
@@ -841,20 +1090,32 @@ func startServices(stage StageExecution) (string, func(), error) {
 		return "", noop, fmt.Errorf("creating service network: %w", result.Error)
 	}
 	var names []string
+	var envFiles []string
 	cleanup := func() {
 		for _, name := range names {
 			ExecDocker([]string{"docker", "rm", "-f", name})
 		}
 		ExecDocker([]string{"docker", "network", "rm", network})
+		for _, path := range envFiles {
+			os.Remove(path)
+		}
 	}
 	for _, svc := range stage.Services {
 		container := network + "-" + strings.TrimPrefix(cacheVolumeName(svc.Name), "gosonic-cache-")
+		envFile, err := writeEnvFile(svc.Environment, nil)
+		if err != nil {
+			cleanup()
+			return "", noop, err
+		}
+		if envFile != "" {
+			envFiles = append(envFiles, envFile)
+		}
 		args := []string{"docker", "run", "-d", "--name", container, "--network", network, "--network-alias", svc.Name}
-		for k, v := range svc.Environment {
-			args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+		if envFile != "" {
+			args = append(args, "--env-file", envFile)
 		}
 		for _, port := range svc.Ports {
-			args = append(args, "-p", port)
+			args = append(args, "-p", publishedPort(port))
 		}
 		args = append(args, svc.Image)
 		if result := ExecDocker(args); result.Error != nil {

@@ -97,6 +97,7 @@ func TestOnceActionRunsOnce(t *testing.T) {
 			Before:   []HookRef{{Uses: "build-image"}},
 		}
 	}
+	t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", "1")
 	gate := &actionOnce{}
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -210,6 +211,29 @@ func TestArtifactsAndCoverage(t *testing.T) {
 	assert.Error(t, err)
 	err = checkCoverage(Stage{Coverage: &Coverage{Enabled: true, Threshold: 60, File: "cover.out", Format: "percent"}})
 	assert.NoError(t, err)
+}
+
+func TestArtifactSymlinkCannotEscape(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "secret"), []byte("secret"), 0600))
+	require.NoError(t, os.Symlink(filepath.Join(outside, "secret"), filepath.Join(dir, "link.txt")))
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(dir))
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	err = collectArtifacts("test", Stage{Artifacts: []string{"link.txt"}})
+	assert.Error(t, err)
+	_, statErr := os.Stat(filepath.Join(".sonic-artifacts", "test", "link.txt"))
+	assert.True(t, os.IsNotExist(statErr))
+
+	err = collectArtifacts("test", Stage{Artifacts: []string{"../secret"}})
+	assert.Error(t, err)
+
+	require.NoError(t, os.Symlink(filepath.Join(outside, "secret"), "cover.out"))
+	err = checkCoverage(Stage{Coverage: &Coverage{Enabled: true, Threshold: 1, File: "cover.out", Format: "percent"}})
+	assert.Error(t, err)
 }
 
 func withCLI(fn func(ctx *cli.Context) error) error {

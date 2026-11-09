@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -461,6 +462,9 @@ func runAction(ctx *cli.Context, uses string, action Action, stage Stage, config
 			Timeout:          action.Timeout,
 			WorkingDirectory: action.WorkingDirectory,
 			DockerSocket:     action.DockerSocket,
+			Secrets:          action.Secrets,
+			User:             action.User,
+			PidsLimit:        action.PidsLimit,
 		}
 		if actionStage.Runner == "" {
 			actionStage.Runner = stage.Runner
@@ -525,22 +529,14 @@ func collectArtifacts(stageName string, stage Stage) error {
 	if len(stage.Artifacts) == 0 {
 		return nil
 	}
-	base := hostWorkspace(stage)
+	root, err := os.OpenRoot(hostWorkspace(stage))
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	destRoot := filepath.Join(".sonic-artifacts", sanitizePath(stageName))
 	for _, rel := range stage.Artifacts {
-		src := filepath.Join(base, rel)
-		info, err := os.Stat(src)
-		if err != nil {
-			return fmt.Errorf("artifact %q: %w", rel, err)
-		}
-		dest := filepath.Join(destRoot, rel)
-		if info.IsDir() {
-			if err := copyDir(src, dest); err != nil {
-				return fmt.Errorf("artifact %q: %w", rel, err)
-			}
-			continue
-		}
-		if err := copyFile(src, dest); err != nil {
+		if err := copyArtifact(root, destRoot, rel); err != nil {
 			return fmt.Errorf("artifact %q: %w", rel, err)
 		}
 	}
@@ -554,7 +550,21 @@ func checkCoverage(stage Stage) error {
 	if stage.Coverage.File == "" {
 		return fmt.Errorf("coverage is enabled but no file is set")
 	}
-	data, err := os.ReadFile(filepath.Join(hostWorkspace(stage), stage.Coverage.File))
+	root, err := os.OpenRoot(hostWorkspace(stage))
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	rel, err := cleanWorkspaceRel(stage.Coverage.File)
+	if err != nil {
+		return fmt.Errorf("reading coverage file: %w", err)
+	}
+	file, err := root.Open(rel)
+	if err != nil {
+		return fmt.Errorf("reading coverage file: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
 	if err != nil {
 		return fmt.Errorf("reading coverage file: %w", err)
 	}
@@ -580,11 +590,73 @@ func sanitizePath(value string) string {
 	return b.String()
 }
 
-func copyFile(src, dest string) error {
+func cleanWorkspaceRel(rel string) (string, error) {
+	if rel == "" || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("path escapes the workspace")
+	}
+	cleaned := filepath.Clean(rel)
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes the workspace")
+	}
+	return cleaned, nil
+}
+
+func artifactDest(destRoot, rel string) (string, error) {
+	rootAbs, err := filepath.Abs(destRoot)
+	if err != nil {
+		return "", err
+	}
+	dest := filepath.Join(rootAbs, filepath.FromSlash(rel))
+	destAbs, err := filepath.Abs(dest)
+	if err != nil {
+		return "", err
+	}
+	relToRoot, err := filepath.Rel(rootAbs, destAbs)
+	if err != nil {
+		return "", err
+	}
+	if relToRoot == ".." || strings.HasPrefix(relToRoot, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes the destination")
+	}
+	return destAbs, nil
+}
+
+func copyArtifact(root *os.Root, destRoot, rel string) error {
+	cleaned, err := cleanWorkspaceRel(rel)
+	if err != nil {
+		return err
+	}
+	info, err := root.Stat(cleaned)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fs.WalkDir(root.FS(), cleaned, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			dest, err := artifactDest(destRoot, path)
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return os.MkdirAll(dest, 0755)
+			}
+			return copyArtifactFile(root, path, dest)
+		})
+	}
+	dest, err := artifactDest(destRoot, cleaned)
+	if err != nil {
+		return err
+	}
+	return copyArtifactFile(root, cleaned, dest)
+}
+
+func copyArtifactFile(root *os.Root, rel, dest string) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 		return err
 	}
-	in, err := os.Open(src)
+	in, err := root.Open(rel)
 	if err != nil {
 		return err
 	}
@@ -598,21 +670,4 @@ func copyFile(src, dest string) error {
 		return err
 	}
 	return out.Close()
-}
-
-func copyDir(src, dest string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dest, rel)
-		if info.IsDir() {
-			return os.MkdirAll(target, 0755)
-		}
-		return copyFile(path, target)
-	})
 }

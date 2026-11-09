@@ -24,6 +24,9 @@ func NewFileStore(directory string, verbose bool) *FileStore {
 
 // Store implements AuditStore for FileStore
 func (fs *FileStore) Store(log AuditLog) error {
+	if err := signLog(&log); err != nil {
+		return fmt.Errorf("signing audit log: %w", err)
+	}
 	data, err := log.marshalLog()
 	if err != nil {
 		return fmt.Errorf("marshaling audit log: %w", err)
@@ -36,7 +39,7 @@ func (fs *FileStore) Store(log AuditLog) error {
 
 	logPath := filepath.Join(fs.Directory, log.generateFilename())
 
-	if err := os.WriteFile(logPath, data, 0644); err != nil {
+	if err := os.WriteFile(logPath, data, 0600); err != nil {
 		return fmt.Errorf("writing audit log: %w", err)
 	}
 
@@ -80,6 +83,13 @@ func (fs *FileStore) LoadLogs(project, gitRevision string) ([]AuditLog, error) {
 		if err := json.Unmarshal(data, &log); err != nil {
 			return nil, fmt.Errorf("parsing log file %s: %w", entry.Name(), err)
 		}
+		trusted, err := logTrusted(log)
+		if err != nil {
+			return nil, err
+		}
+		if !trusted {
+			continue
+		}
 
 		// Only include logs for the specified git revision
 		if log.GitRevision == gitRevision {
@@ -91,5 +101,40 @@ func (fs *FileStore) LoadLogs(project, gitRevision string) ([]AuditLog, error) {
 		fmt.Printf("Loaded %d audit logs\n", len(logs))
 	}
 
+	return logs, nil
+}
+
+// ListLogs reads every audit file for a project, across git revisions.
+// A missing directory is an empty result.
+func (fs *FileStore) ListLogs(project string) ([]AuditLog, error) {
+	entries, err := os.ReadDir(fs.Directory)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading logs directory: %w", err)
+	}
+
+	var logs []AuditLog
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), project+"-") || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(fs.Directory, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("reading log file %s: %w", entry.Name(), err)
+		}
+		var log AuditLog
+		if err := json.Unmarshal(data, &log); err != nil {
+			return nil, fmt.Errorf("parsing log file %s: %w", entry.Name(), err)
+		}
+		trusted, err := logTrusted(log)
+		if err != nil {
+			return nil, err
+		}
+		if trusted && log.Project == project {
+			logs = append(logs, log)
+		}
+	}
 	return logs, nil
 }

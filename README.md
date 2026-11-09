@@ -32,25 +32,31 @@ Think of gosonic as a more powerful, containerized alternative to Makefiles, bri
 1. [Introduction](#introduction)
 2. [Installation](#installation)
 3. [Configuration](#configuration)
-   - [Project Configuration](#project-configuration)
-   - [Stage Configuration](#stage-configuration)
+   - [Project Structure](#project-structure)
+   - [Stages](#stages)
    - [Workflows](#workflows)
    - [Suites](#suites)
    - [Runner Configuration](#runner-configuration)
-   - [Volume Configuration](#volume-configuration)
+   - [Volume Mounts](#volume-mounts)
 4. [Command Line Interface](#command-line-interface)
    - [Environment Variables](#environment-variables)
 5. [Execution Variables](#execution-variables)
    - [Using Variables in Configuration](#using-variables-in-configuration)
 6. [Audit Logging](#audit-logging)
-   - [Configuration](#audit-configuration)
+   - [Configuration](#configuration-1)
+   - [Signatures](#signatures)
    - [AWS Credentials for S3 Audit Logging](#aws-credentials-for-s3-audit-logging)
 7. [CI/CD Integration](#cicd-integration)
    - [GitHub Actions](#github-actions)
    - [GitLab CI](#gitlab-ci)
    - [Azure DevOps](#azure-devops)
    - [Benefits of gosonic in CI/CD](#benefits-of-gosonic-in-cicd)
-8. [Security Considerations](#security-considerations)
+8. [Security](#security)
+   - [Secrets](#secrets)
+   - [Signed audit records](#signed-audit-records)
+   - [Container isolation](#container-isolation)
+   - [Images](#images)
+   - [Artifact paths](#artifact-paths)
 9. [Development](#development)
    - [Building from Source](#building-from-source)
    - [Running Tests](#running-tests)
@@ -61,7 +67,7 @@ Think of gosonic as a more powerful, containerized alternative to Makefiles, bri
 ### From Source
 
 Requirements:
-- Go 1.21 or later
+- Go 1.24 or later
 - Docker
 
 ```bash
@@ -174,11 +180,15 @@ stages:
 Each stage can define:
 
 - `runner`: Alias defined in `runners`, or a Docker image (e.g., "docker/library/golang:1.20-alpine3.17")
-- `commands`: List of commands to execute
+- `commands`: List of commands to execute. gosonic does not substitute `${var}` inside commands
+- `shell`: Program used for a multi-command stage. Default `sh`
 - `volumes`: List of volume mounts
-- `environment`: Map of environment variables
-- `requires`: List of stages that must complete successfully before this stage can run
+- `environment`: Map of environment variables. Values are passed in an env file, not on the `docker` command line
+- `secrets`: Names of variables to read from the gosonic process environment. Values are not taken from YAML
+- `requires`: List of stages that must have a signed successful audit record before this stage can run
 - `timeout`: Maximum execution time
+- `user`: Container user, passed as `--user`. Default is the host uid and gid
+- `pids_limit`: Process limit inside the container. Default `4096`
 
 Define an image once under `runners` and use the alias in each stage. A runner that does not match an alias is still used as an image reference.
 
@@ -221,9 +231,10 @@ stages:
 ```
 
 When running a stage with dependencies:
-- gosonic verifies if all required stages have completed successfully
+- gosonic checks that every required stage has a signed audit record with status `success` or `skipped`
+- A missing signature, or a record signed with a different key, does not count
 - Required stages must be run before the dependent stage
-- Dependencies are verified using the audit logs from previous runs
+- The same signing key has to be available to the later run. Set `GOSONIC_AUDIT_HMAC_KEY` when runs do not share a home directory
 
 Example execution:
 ```bash
@@ -297,7 +308,7 @@ gosonic ci run --jobs 4 lint test build
 When `--jobs` is greater than 1, gosonic schedules the stages you named:
 
 - A stage starts only after every `requires` entry from this same command has succeeded in this run.
-- A requirement that you did not name must already be recorded as successful in the audit log.
+- A requirement that you did not name must already have a signed `success` or `skipped` audit record.
 - A failure does not start anything further. Stages that have already started are allowed to finish.
 - Output lines are prefixed with the stage name.
 
@@ -305,7 +316,9 @@ Parallel stages still share the default `.` bind mount at `/workspace`. Do not r
 
 ### Volume Mounts
 
-By default, go-sonic automatically mounts the current directory (`.`) to `/workspace` in the container. This can be overridden by explicitly defining a different workspace mount. If the daemon rejects that bind because the path is not shared from the host, gosonic copies the working directory (except `target/`) into a temporary volume and mounts that instead.
+By default, gosonic mounts the current directory (`.`) at `/workspace`. When that bind is the workspace, `.git` and `.sonic` are mounted read-only on top of it, including when `.git` is a file in a worktree. A different workspace bind replaces the default. If the daemon rejects the bind because the path is not shared from the host, gosonic copies the working directory (except `target/`) into a temporary volume and mounts that instead.
+
+A bind whose source is the audit signing key, the directory that holds it, or any parent of that directory is refused. Mounting `$HOME` fails for that reason when the key lives under the home directory. Mount `~/.aws` or another specific directory instead.
 
 ```yaml
 volumes:
@@ -352,7 +365,7 @@ volumes:
 
 `actions` defines reusable bodies. A stage runs an action from `before`, `steps`, or `after`.
 
-- An action with `runner` is its own container. Set `docker_socket: true` when that container should talk to the host Docker daemon, for example to `docker build` an image that later stages run.
+- An action with `runner` is its own container. Set `docker_socket: true` when that container should talk to the host Docker daemon, for example to `docker build` an image that later stages run. The run also needs `--allow-docker-socket` or `GOSONIC_ALLOW_DOCKER_SOCKET=1`.
 - An action without `runner` is a command fragment. Its commands run inside the calling stage's container.
 - `before` must succeed before the stage body starts. `after` defaults to `when: always`, so it also runs when the stage fails. The stage failure is still returned.
 - `once: true` runs that action at most once per `gosonic run`. Every stage that lists it waits for that single run, including under `--jobs`.
@@ -387,14 +400,17 @@ Other stage fields:
 
 - `working_directory`: container workdir. Default `/workspace`.
 - `timeout`: Go duration. The container is killed when it expires.
-- `artifacts`: after a successful stage, copy these workspace-relative paths to `.sonic-artifacts/<stage>/`. A missing path fails the stage.
-- `coverage`: when `enabled` is true, read `file`. `format: percent` reads a number; `format: go` reads a Go cover profile. The stage fails when the percentage is below `threshold`.
+- `artifacts`: after a successful stage, copy these workspace-relative paths to `.sonic-artifacts/<stage>/`. A missing path fails the stage. A path that leaves the workspace, including through a symlink, is rejected.
+- `coverage`: when `enabled` is true, read `file` from inside the workspace. `format: percent` reads a number; `format: go` reads a Go cover profile. The stage fails when the percentage is below `threshold`.
 - `when`: skip the stage unless the expression matches. Supported forms are `env:NAME`, `env:NAME=value`, and a leading `!`. A skipped stage is audited as `skipped` and satisfies `requires`. The same expressions gate `after` actions, along with `always`, `success`, and `failure`.
-- `docker_socket`: bind-mount `/var/run/docker.sock` for this stage.
-- `services`: start named containers on a private network before the stage and remove them afterward. Each service has `image`, `environment`, and `ports`. The stage reaches a service by its name.
+- `docker_socket`: bind-mount `/var/run/docker.sock` for this stage. Ignored unless the run passes `--allow-docker-socket` or `GOSONIC_ALLOW_DOCKER_SOCKET` is `1` or `true`. The socket's group is added so a non-root user can use it. A volume entry that mounts the socket path directly is not covered by this flag.
+- `secrets`: environment variable names. gosonic reads each value from its own environment and drops `GOSONIC_AUDIT_HMAC_KEY` and `GOSONIC_AUDIT_HMAC_KEY_FILE` if they appear here.
+- `user`: replaces the default `--user <host-uid>:<host-gid>`. Use `root` only when the image has to.
+- `pids_limit`: replaces the default pid limit of 4096.
+- `services`: start named containers on a private network before the stage and remove them afterward. Each service has `image`, `environment`, and `ports`. The stage reaches a service by its name. A port such as `5432:5432` is published on `127.0.0.1`. A spec that already names an address, such as `0.0.0.0:5432:5432`, is left as written.
 - `matrix`: list of dimension names declared under the top-level `matrix` map. Gosonic runs the Cartesian product. Each cell is a stage instance, and each dimension value is exported as an environment variable of that name. `--matrix key=a,b` overrides a dimension for that invocation.
 
-A locally built image needs a registry host in its name. `localhost/app:dev` is used as written. A name with no registry host is prefixed with `public.ecr.aws`.
+A locally built image needs a registry host in its name. `localhost/app:dev` is used as written. A name with no registry host is prefixed with the default registry, `public.ecr.aws` unless `--registry` says otherwise. The host has to be on the registry allowlist. See [Images](#images).
 
 ### Runner Configuration
 
@@ -403,8 +419,8 @@ The `runner` field in a stage specifies which Docker image to use for execution.
 Runner resolution follows these rules:
 
 Default values:
-- Default registry: `public.ecr.aws` (hardcoded, cannot be changed via flags)
-- Default runner: `public.ecr.aws/docker/library/alpine:latest`
+- Default registry: `public.ecr.aws`, overridable with `--registry` or `GOSONIC_DEFAULT_REGISTRY` when that host is allowed
+- Default runner, when a stage sets no runner: `<default-registry>/docker/library/alpine:latest`
 
 1. If a full image reference is provided (contains domain), it's used as-is:
    ```yaml
@@ -423,13 +439,16 @@ Default values:
    ```
 
 The runner image is used to create a container with:
-- Current directory mounted at `/workspace` (unless overridden)
+- Current directory mounted at `/workspace` (unless overridden), with `.git` and `.sonic` read-only when that bind is the workspace
 - Working directory set to `/workspace`
-- Commands executed using `sh -c`
+- A single simple command as the container entrypoint. Several commands, or a command that needs a shell, run under `sh -c` unless `shell` is set
+- Environment and secrets passed with `--env-file`, then the file is removed
+- Container user set to the host uid and gid, unless `user` is set
+- `--cap-drop ALL`, `--security-opt no-new-privileges`, and `--pids-limit 4096`
 - Container removed after execution (`--rm`)
 - Init process enabled (`--init`)
 
-You can override these defaults using the `volumes` and other configuration options in the stage definition.
+An image reference without `@sha256:` prints a warning. `--require-image-digest` turns that warning into an error. Allowed registry hosts are `docker.io`, `public.ecr.aws`, `ghcr.io`, `quay.io`, and `localhost` (a port on an allowed host is fine). Add more with `allowed_registries` in the workflow. A host outside that set, including a default registry set with `--registry`, fails the stage before `docker run`.
 
 ## Command Line Interface
 
@@ -461,6 +480,11 @@ GLOBAL OPTIONS:
    --registry value                Default Docker registry to use when not specified in image reference
                                    Default: "public.ecr.aws"
                                    Environment: GOSONIC_DEFAULT_REGISTRY
+
+   --allow-docker-socket           Allow stages and actions that set docker_socket
+                                   Environment: GOSONIC_ALLOW_DOCKER_SOCKET
+
+   --require-image-digest          Fail when an image has no @sha256 digest
    
    --verbose                       Enable verbose output
                                    Environment: GOSONIC_VERBOSE
@@ -477,8 +501,11 @@ All command line flags can also be set using environment variables:
 - `SONIC_AUDIT_STORE`: Audit log storage type
 - `SONIC_AUDIT_PATH`: Path for audit logs
 - `SONIC_AUDIT_S3_BUCKET`: S3 bucket for audit logs
-- `GOSONIC_DEFAULT_REGISTRY`: Default Docker registry
+- `GOSONIC_DEFAULT_REGISTRY`: Default Docker registry. The host must be on the allowlist
+- `GOSONIC_ALLOW_DOCKER_SOCKET`: Set to `1` or `true` to allow `docker_socket`
 - `GOSONIC_VERBOSE`: Enable verbose output
+- `GOSONIC_AUDIT_HMAC_KEY`: Base64 signing key, at least 32 bytes after decoding. Takes precedence over the key file
+- `GOSONIC_AUDIT_HMAC_KEY_FILE`: Path to a raw key file of at least 32 bytes. When neither this nor `GOSONIC_AUDIT_HMAC_KEY` is set, gosonic creates `~/.config/gosonic/audit.key`
 
 Example using environment variables:
 ```bash
@@ -490,7 +517,11 @@ gosonic ci run build
 
 ## Execution Variables
 
-You can pass variables to be used during stage execution using the `--var` flag. These variables can be referenced in your configuration using `${variable}` syntax.
+You can pass variables to be used during stage execution using the `--var` flag. Names that are valid environment variables (`AWS_PROFILE`, not `region.name`) are exported into the container when the stage does not already set that name. The shell expands `$NAME` or `${NAME}`. gosonic does not paste those values into `commands` or `steps.run`. Quote them in the script (`"$AWS_PROFILE"`). An unquoted expansion is still evaluated by the shell.
+
+Names such as `region.name` are substituted into environment values, volume paths, image names, `when` expressions, and audit settings. They are not exported.
+
+Do not pass secret values with `--var`. The value is visible in the shell history and in the gosonic process arguments. List the name under `secrets` and export the value in the environment that launches gosonic. See [Secrets](#secrets).
 
 ```bash
 # Run deploy stage with specific region
@@ -502,9 +533,14 @@ gosonic ci run deploy --var region.name=us-east-1 --var env=prod
 
 ### Using Variables in Configuration
 
-Variables can be used in:
-- Environment variables
+`${...}` is substituted in:
+- Environment values
 - Volume paths
+- Runner and image names
+- `when` expressions
+- Audit bucket, prefix, and AWS profile
+
+It is not substituted in `commands` or `steps.run`.
 
 Example:
 ```yaml
@@ -526,12 +562,13 @@ stages:
 
 ## Audit Logging
 
-go-sonic automatically audit logs all stage executions. Each log includes:
+gosonic writes an audit record for each stage execution. `requires` trusts that record only when its signature verifies. Each record includes:
 - Project and stage information
 - Git revision
-- Command executed
+- Command executed, which is the `docker` argument list and does not include environment values
 - Start time and duration
 - Execution status and any errors
+- HMAC signature over project, git revision, stage, command, start time, duration, status, and error
 
 ### Configuration
 
@@ -563,6 +600,7 @@ export SONIC_AUDIT_PATH=ci-logs/
 #### File Store (Default)
 - Type: `file`
 - Stores logs as JSON files in a local directory
+- Each file is mode `0600`
 - Default directory: `.logs`
 - Configure path using:
   - Config: `audit.path`
@@ -595,6 +633,20 @@ audit:
   s3bucket: "my-audit-logs"
   path: "ci-logs/"
 ```
+
+### Signatures
+
+Every stored record is signed with HMAC-SHA256. The signature covers the project, git revision, stage, command, start time, duration, status, and error. `LoadLogs` drops a record whose signature is missing or does not match, so a stage that can write the log directory cannot mint a `success` that satisfies `requires`.
+
+Key selection:
+
+1. `GOSONIC_AUDIT_HMAC_KEY`, base64, at least 32 bytes after decoding
+2. `GOSONIC_AUDIT_HMAC_KEY_FILE`, a file of at least 32 raw bytes
+3. Otherwise `~/.config/gosonic/audit.key`, created mode `0600` on first use and reused after that
+
+The key is not copied into the container, and a bind of the key file or any directory that contains it is refused. Runs that check `requires` against records from another process need the same key. Set `GOSONIC_AUDIT_HMAC_KEY` from the CI secret store when the home directory is not shared. Records written by older versions of gosonic are unsigned and no longer satisfy `requires`.
+
+Deleting a newer failure record still leaves an older signed success as the newest record for that stage. Signing does not prevent that.
 
 ### AWS Credentials for S3 Audit Logging
 
@@ -724,8 +776,12 @@ jobs:
       - name: Deploy (if main)
         if: github.ref == 'refs/heads/main'
         env:
-          AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          # Names listed under secrets: in the workflow. Values stay in the
+          # Actions environment and are not written into the workflow file.
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # Same key on every job so a later job can verify requires.
+          GOSONIC_AUDIT_HMAC_KEY: ${{ secrets.GOSONIC_AUDIT_HMAC_KEY }}
         run: gosonic ci run deploy
 ```
 
@@ -846,11 +902,13 @@ steps:
 
 3. **Built-in Audit Trail**
    - Automatic logging of all build steps
+   - HMAC-signed records, so `requires` does not trust a log the container wrote itself
    - Support for both local and S3-based audit logs
    - Consistent logging across all platforms
 
 4. **Docker-based Isolation**
    - Clean build environment for every run
+   - Containers run as the host user, with capabilities dropped
    - No dependency on CI/CD platform's installed tools
    - Reproducible builds across environments
 
@@ -892,27 +950,105 @@ Each cell exports the dimension values as environment variables. Run a subset wi
 gosonic ci run deploy --matrix region=us-east-1,eu-west-1 --matrix environment=staging,production
 ```
 
-### Security Considerations
+## Security
 
-1. **Secrets Management**
-   - Use CI/CD platform's native secrets management
-   - Pass secrets as environment variables to gosonic
-   - Avoid hardcoding sensitive values in `.sonic.yml`
+gosonic runs untrusted commands inside a container, then trusts the audit record when a later stage says `requires`. The controls below are what that split depends on. They do not replace the CI system's own secret store or runner isolation.
 
-2. **Artifact Security**
-   - Use read-only volume mounts for sensitive files
-   - Leverage CI/CD platform's artifact encryption
-   - Enable audit logging for traceability
+### Secrets
 
-3. **Access Control**
-   - Use minimal required permissions for service accounts
-   - Leverage CI/CD platform's RBAC features
-   - Implement stage-specific access controls
+Put secret values in the environment that starts gosonic, and list only the names in the workflow:
+
+```yaml
+stages:
+  deploy:
+    runner: aws-cli
+    secrets:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+    commands:
+      - aws sts get-caller-identity
+```
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+gosonic ci run deploy
+```
+
+gosonic reads each name from its own environment. A missing name fails the stage. The values are written to a temporary env file, mode `0600`, outside the repository, passed as `--env-file`, and deleted when the container exits. The logged `docker` command contains the file path, not the values. `environment:` entries and exported `--var` names travel in that same file.
+
+`GOSONIC_AUDIT_HMAC_KEY` and `GOSONIC_AUDIT_HMAC_KEY_FILE` are never copied into that file, even if a stage lists them.
+
+Do not put secret values in the workflow file. Do not pass them with `--var`: that puts the value in your shell history and in the arguments of the gosonic process. Non-secret settings such as `AWS_PROFILE` or `AWS_REGION` are fine as `--var` or `environment`.
+
+A value you do put in `environment:` is not printed on the `docker` command line, but it is still stored in the workflow file. Use `secrets` for anything that must not be in git.
+
+### Signed audit records
+
+`requires` reads the newest audit record for a stage and accepts status `success` or `skipped`. Those records are HMAC-signed with a key the container does not receive. A stage that can write `.logs`, or any other audit directory inside the workspace, cannot forge a success that a later run will accept.
+
+Details of the key and the signed fields are in [Signatures](#signatures). In short:
+
+- Set `GOSONIC_AUDIT_HMAC_KEY` in CI so every job verifies records with the same key. The default file under `~/.config` is per machine and is a new key whenever that directory is empty.
+- File records are mode `0600`.
+- Unsigned records from older gosonic versions do not satisfy `requires`. Re-run those stages after upgrading.
+- A container that can delete files can still remove a failure and leave an older signed success in place. Signing does not stop deletion.
+
+### Container isolation
+
+Each stage container is started with:
+
+- `--user` set to the host uid and gid, unless the stage sets `user`
+- `--cap-drop ALL`
+- `--security-opt no-new-privileges`
+- `--pids-limit 4096`, unless the stage sets `pids_limit`
+- `--rm` and `--init`
+
+There is no default memory limit. A compiler or test runner that needs more than 4096 processes can set `pids_limit`.
+
+The workspace is mounted read-write so the stage can write build output. On top of a workspace bind, `.git` and `.sonic` are mounted read-only, so the container cannot install a git hook or rewrite the workflow that later stages will load. Cache and tmp volumes are unchanged.
+
+`docker_socket: true` mounts the host Docker socket, which is root on the host for anyone who can use it. gosonic will not add that mount unless you pass `--allow-docker-socket` or set `GOSONIC_ALLOW_DOCKER_SOCKET` to `1` or `true`. When the mount is allowed, the socket's group is added so the non-root user can open it. A stage that is allowed the socket can read the signing key off the host filesystem. Treat that opt-in as a break in the audit signature guarantee. Writing the socket path yourself under `volumes` is not gated by the flag. Prefer `docker_socket`.
+
+Service `ports` are published on `127.0.0.1` unless the spec already includes an address. `5432:5432` becomes `127.0.0.1:5432:5432`. `0.0.0.0:5432:5432` stays reachable on every interface.
+
+The workspace mount is still the whole repository, read-write, except for `.git` and `.sonic`. A stage can write other files the next stage will compile. That is the build cache and the artifact path. Do not keep secrets in the repository.
+
+### Images
+
+Resolved image hosts must be one of `docker.io`, `public.ecr.aws`, `ghcr.io`, `quay.io`, or `localhost`. A port is allowed when the hostname is, so `localhost:5000/app:dev` is accepted. `allowed_registries` in the workflow adds hosts. It does not remove the built-in ones.
+
+```yaml
+allowed_registries:
+  - registry.example.com
+```
+
+`--registry` and `GOSONIC_DEFAULT_REGISTRY` set the host used when an image name has none. That host is checked against the same list. An image that already names a registry is checked on its own host.
+
+Images are not pulled by digest unless you write the digest. A reference without `@sha256:` prints a warning on stderr, once per image per process. `--require-image-digest` makes the missing digest an error. Tags such as `docker.io/library/docker:27-cli` keep working until you opt in.
+
+gosonic does not verify image signatures. Pin a digest, or verify the image with your own tooling, when the registry is not a sufficient trust boundary.
+
+### Artifact paths
+
+After a successful stage, `artifacts` and `coverage.file` are read on the host from the workspace directory. Paths are opened relative to that directory. An absolute path, a `..` segment that leaves the workspace, or a symlink whose target leaves the workspace fails the stage. A container cannot point `dist` at `~/.aws` and have the host copy those credentials into `.sonic-artifacts`.
+
+```yaml
+stages:
+  test:
+    artifacts:
+      - cover.out
+    coverage:
+      enabled: true
+      file: cover.out
+      format: percent
+      threshold: 80
+```
 
 ## Development
 
 Requirements:
-- Go 1.21 or later
+- Go 1.24 or later
 - Docker
 
 ### Building from Source
