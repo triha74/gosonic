@@ -899,3 +899,25 @@ func captureFD(t *testing.T, fn func()) (string, string) {
 	os.Stderr = oldStderr
 	return <-outC, <-errC
 }
+
+func TestEnvFileValuesAreLiteral(t *testing.T) {
+	path, err := writeEnvFile(map[string]string{
+		"SPACED":  "a b",
+		"EMPTY":   "",
+		"QUOTE":   `q"uote`,
+		"BACKSLH": `back\slash`,
+		"HASH":    "x#y",
+	}, nil)
+	assert.NoError(t, err)
+	defer os.Remove(path)
+
+	data, err := os.ReadFile(path)
+	assert.NoError(t, err)
+	assert.Equal(t, "BACKSLH=back\\slash\nEMPTY=\nHASH=x#y\nQUOTE=q\"uote\nSPACED=a b\n", string(data))
+}
+
+func TestEnvFileRejectsMultilineValue(t *testing.T) {
+	_, err := writeEnvFile(map[string]string{"KEY": "one\ntwo"}, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "spans lines")
+}

@@ -699,7 +699,11 @@ func writeEnvFile(env map[string]string, secrets []string) (string, error) {
 	sort.Strings(keys)
 	var body strings.Builder
 	for _, key := range keys {
-		body.WriteString(envFileLine(key, merged[key]))
+		line, err := envFileLine(key, merged[key])
+		if err != nil {
+			return "", err
+		}
+		body.WriteString(line)
 		body.WriteByte('\n')
 	}
 	file, err := os.CreateTemp("", "gosonic-env-*")
@@ -724,12 +728,15 @@ func writeEnvFile(env map[string]string, secrets []string) (string, error) {
 	return path, nil
 }
 
-func envFileLine(key, value string) string {
-	if value == "" || strings.ContainsAny(value, "\r\n\"'\\ #") || strings.TrimSpace(value) != value {
-		escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`).Replace(value)
-		return key + `="` + escaped + `"`
+// envFileLine writes one docker --env-file entry. Docker takes everything after
+// the first "=" literally: it does not strip quotes or process escapes. So the
+// value is written as-is, and an empty value stays empty rather than becoming
+// two quote characters. A newline cannot be represented, so it is an error.
+func envFileLine(key, value string) (string, error) {
+	if strings.ContainsAny(value, "\r\n") {
+		return "", fmt.Errorf("value for %s spans lines and cannot be passed in an env file", key)
 	}
-	return key + "=" + value
+	return key + "=" + value, nil
 }
 
 func publishedPort(spec string) string {
