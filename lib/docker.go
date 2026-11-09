@@ -292,6 +292,7 @@ type StageExecution struct {
 	DockerSocket      bool
 	AllowDockerSocket bool
 	Secrets           []string
+	OptionalSecrets   []string
 	User              string
 	PidsLimit         int
 	Services          []ServiceSpec
@@ -311,7 +312,7 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 		gitRev = "unknown" // Don't fail if we can't get git revision
 	}
 
-	envFile, err := writeEnvFile(stage.Environment, stage.Secrets)
+	envFile, err := writeEnvFile(stage.Environment, stage.Secrets, stage.OptionalSecrets)
 	if err != nil {
 		return err
 	}
@@ -668,8 +669,8 @@ func mountsAuditKey(source, keyPath string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
 
-func writeEnvFile(env map[string]string, secrets []string) (string, error) {
-	merged := make(map[string]string, len(env)+len(secrets))
+func writeEnvFile(env map[string]string, secrets, optionalSecrets []string) (string, error) {
+	merged := make(map[string]string, len(env)+len(secrets)+len(optionalSecrets))
 	for key, value := range env {
 		if ProtectedEnv(key) {
 			continue
@@ -687,6 +688,18 @@ func writeEnvFile(env map[string]string, secrets []string) (string, error) {
 		if !ok {
 			return "", fmt.Errorf("secret %s is not set in the environment", name)
 		}
+		merged[name] = value
+	}
+	// optional_secrets: an unset name is passed as an empty value instead of
+	// failing the stage. A set name is passed with its value, like secrets.
+	for _, name := range optionalSecrets {
+		if name == "" {
+			return "", fmt.Errorf("optional secret name is empty")
+		}
+		if ProtectedEnv(name) {
+			continue
+		}
+		value, _ := os.LookupEnv(name)
 		merged[name] = value
 	}
 	if len(merged) == 0 {
@@ -1109,7 +1122,7 @@ func startServices(stage StageExecution) (string, func(), error) {
 	}
 	for _, svc := range stage.Services {
 		container := network + "-" + strings.TrimPrefix(cacheVolumeName(svc.Name), "gosonic-cache-")
-		envFile, err := writeEnvFile(svc.Environment, nil)
+		envFile, err := writeEnvFile(svc.Environment, nil, nil)
 		if err != nil {
 			cleanup()
 			return "", noop, err

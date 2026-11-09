@@ -587,6 +587,7 @@ type Action struct {
 	Volumes          []lib.Volume      `yaml:"volumes,omitempty"`
 	DockerSocket     bool              `yaml:"docker_socket,omitempty"`
 	Secrets          []string          `yaml:"secrets,omitempty"`
+	OptionalSecrets  []string          `yaml:"optional_secrets,omitempty"`
 	User             string            `yaml:"user,omitempty"`
 	PidsLimit        int               `yaml:"pids_limit,omitempty"`
 	Once             bool              `yaml:"once,omitempty"`
@@ -612,6 +613,7 @@ type Stage struct {
 	WorkingDirectory string            `yaml:"working_directory,omitempty"`
 	DockerSocket     bool              `yaml:"docker_socket,omitempty"`
 	Secrets          []string          `yaml:"secrets,omitempty"`
+	OptionalSecrets  []string          `yaml:"optional_secrets,omitempty"`
 	User             string            `yaml:"user,omitempty"`
 	PidsLimit        int               `yaml:"pids_limit,omitempty"`
 	Services         []Service         `yaml:"services,omitempty"`
@@ -935,12 +937,16 @@ func withoutRequires(stage Stage, skip map[string]bool) Stage {
 	return stage
 }
 
+// socketAllowed reports whether stages may mount the Docker socket. It is
+// allowed by default. Set GOSONIC_ALLOW_DOCKER_SOCKET to 0 or false to turn
+// it off. Any other value that is not a recognized "on" value also turns it
+// off, so a typo fails closed.
 func socketAllowed(ctx *cli.Context) bool {
 	if ctx != nil && ctx.Bool("allow-docker-socket") {
 		return true
 	}
-	switch strings.ToLower(os.Getenv("GOSONIC_ALLOW_DOCKER_SOCKET")) {
-	case "1", "true", "t", "yes":
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOSONIC_ALLOW_DOCKER_SOCKET"))) {
+	case "", "1", "true", "t", "yes":
 		return true
 	default:
 		return false
@@ -1034,6 +1040,7 @@ func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, sk
 		DockerSocket:      stage.DockerSocket,
 		AllowDockerSocket: socketAllowed(ctx),
 		Secrets:           stage.Secrets,
+		OptionalSecrets:   stage.OptionalSecrets,
 		User:              stage.User,
 		PidsLimit:         stage.PidsLimit,
 		Services:          services,
@@ -1230,7 +1237,7 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 		},
 		&cli.BoolFlag{
 			Name:    "allow-docker-socket",
-			Usage:   "Allow stages to mount the Docker socket",
+			Usage:   "Allow stages to mount the Docker socket (on by default; set to 0 or false to disable)",
 			EnvVars: []string{"GOSONIC_ALLOW_DOCKER_SOCKET"},
 		},
 		&cli.BoolFlag{
@@ -1285,8 +1292,10 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 	var config *Config
 	var err error
 	config, err = loadConfig(configPath, vars)
+	var loadErr error
 	if err != nil {
-		config = &Config{} // Use empty config if loading fails
+		config = &Config{} // Help still renders with no stages; run reports loadErr
+		loadErr = err
 	}
 
 	// Add the run command after config is loaded
@@ -1310,6 +1319,11 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 			if !ctx.Args().Present() {
 				cli.HelpPrinter(ctx.App.Writer, cli.CommandHelpTemplate, ctx.Command)
 				return nil
+			}
+			if loadErr != nil {
+				// Without a loaded config every stage name looks unknown, so
+				// report the real parse error instead.
+				return loadErr
 			}
 
 			jobs := ctx.Int("jobs")

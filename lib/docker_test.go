@@ -907,7 +907,7 @@ func TestEnvFileValuesAreLiteral(t *testing.T) {
 		"QUOTE":   `q"uote`,
 		"BACKSLH": `back\slash`,
 		"HASH":    "x#y",
-	}, nil)
+	}, nil, nil)
 	assert.NoError(t, err)
 	defer os.Remove(path)
 
@@ -917,7 +917,42 @@ func TestEnvFileValuesAreLiteral(t *testing.T) {
 }
 
 func TestEnvFileRejectsMultilineValue(t *testing.T) {
-	_, err := writeEnvFile(map[string]string{"KEY": "one\ntwo"}, nil)
+	_, err := writeEnvFile(map[string]string{"KEY": "one\ntwo"}, nil, nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "spans lines")
+}
+
+func TestOptionalSecretsAreEmptyWhenUnset(t *testing.T) {
+	t.Setenv("OPT_SET", "value")
+	t.Setenv("OPT_EMPTY", "")
+	os.Unsetenv("OPT_UNSET")
+
+	path, err := writeEnvFile(nil, nil, []string{"OPT_SET", "OPT_EMPTY", "OPT_UNSET"})
+	assert.NoError(t, err)
+	defer os.Remove(path)
+
+	data, err := os.ReadFile(path)
+	assert.NoError(t, err)
+	assert.Equal(t, "OPT_EMPTY=\nOPT_SET=value\nOPT_UNSET=\n", string(data))
+}
+
+func TestRequiredSecretStillFailsWhenUnset(t *testing.T) {
+	os.Unsetenv("REQ_UNSET")
+	_, err := writeEnvFile(nil, []string{"REQ_UNSET"}, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not set")
+}
+
+func TestOptionalSecretsCannotLeakAuditKey(t *testing.T) {
+	t.Setenv("GOSONIC_AUDIT_HMAC_KEY", "should-not-leak")
+	path, err := writeEnvFile(nil, nil, []string{"GOSONIC_AUDIT_HMAC_KEY"})
+	assert.NoError(t, err)
+	if path == "" {
+		return // the protected name was dropped and nothing else was set
+	}
+	defer os.Remove(path)
+
+	data, err := os.ReadFile(path)
+	assert.NoError(t, err)
+	assert.NotContains(t, string(data), "should-not-leak")
 }

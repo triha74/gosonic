@@ -1619,3 +1619,65 @@ func TestUnsignedAuditLogDoesNotSatisfyRequires(t *testing.T) {
 	assert.NoError(t, store.Store(signed))
 	assert.NoError(t, verifyRequirements(Stage{Requires: []string{"scan"}}, store, "app", "abc"))
 }
+
+func TestSocketAllowedByDefault(t *testing.T) {
+	t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", "")
+	assert.True(t, socketAllowed(nil))
+
+	for _, value := range []string{"1", "true", "yes"} {
+		t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", value)
+		assert.True(t, socketAllowed(nil), value)
+	}
+	for _, value := range []string{"0", "false", "no", "fasle"} {
+		t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", value)
+		assert.False(t, socketAllowed(nil), value)
+	}
+}
+
+func TestActionAcceptsOptionalSecrets(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "ci.yml")
+	assert.NoError(t, os.WriteFile(configPath, []byte(`
+version: "1"
+project:
+  name: app
+actions:
+  fetch:
+    runner: alpine
+    optional_secrets: [GITHUB_TOKEN]
+    commands: ["echo hi"]
+stages:
+  build:
+    runner: alpine
+    steps:
+      - uses: fetch
+    commands: ["echo hi"]
+`), 0644))
+	config, err := loadConfig(configPath, execVars{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, []string{"GITHUB_TOKEN"}, config.Actions["fetch"].OptionalSecrets)
+}
+
+func TestRunReportsConfigParseError(t *testing.T) {
+	t.Setenv("GO_TEST", "1")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "ci.yml")
+	assert.NoError(t, os.WriteFile(configPath, []byte(`
+version: "1"
+project:
+  name: app
+stages:
+  build:
+    runner: alpine
+    no_such_field: true
+    commands: ["echo hi"]
+`), 0644))
+	_, stderr, err := captureOutput(func() error {
+		return run([]string{"gosonic", "--sonic-file", configPath, "run", "build"})
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no_such_field")
+	assert.NotContains(t, stderr, "invalid stage(s)")
+}

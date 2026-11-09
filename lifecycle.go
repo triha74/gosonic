@@ -463,6 +463,7 @@ func runAction(ctx *cli.Context, uses string, action Action, stage Stage, config
 			WorkingDirectory: action.WorkingDirectory,
 			DockerSocket:     action.DockerSocket,
 			Secrets:          action.Secrets,
+			OptionalSecrets:  action.OptionalSecrets,
 			User:             action.User,
 			PidsLimit:        action.PidsLimit,
 		}
