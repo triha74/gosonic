@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"gosonic/lib"
 
@@ -19,6 +22,13 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/urfave/cli/v2"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("GOSONIC_AUDIT_HMAC_KEY") == "" {
+		os.Setenv("GOSONIC_AUDIT_HMAC_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	}
+	os.Exit(m.Run())
+}
 
 type MockAuditStore struct {
 	mock.Mock
@@ -1200,7 +1210,7 @@ stages:
   deploy:
     runner: "kubernetes"
     commands:
-      - "kubectl apply -f k8s/"
+      - "echo ${env}"
     volumes:
       - type: bind
         source: "${HOME}/.kube/${region.name}/config"
@@ -1230,6 +1240,8 @@ stages:
 	assert.Equal(t, "/home/user/.kube/us-east-1/config", deploy.Volumes[0].Source)
 	assert.Equal(t, "us-east-1", deploy.Environment["REGION"])
 	assert.Equal(t, "prod", deploy.Environment["ENV"])
+	assert.Equal(t, "echo ${env}", deploy.Commands[0])
+	assert.Equal(t, "prod", deploy.Environment["env"])
 
 	// Test loading without variables
 	config, err = loadConfig(configPath, nil)
@@ -1524,6 +1536,14 @@ suites:
 	var ran []string
 	lib.ExecDocker = func(args []string) lib.DockerResult {
 		joined := strings.Join(args, " ")
+		for i, arg := range args {
+			if arg == "--env-file" && i+1 < len(args) {
+				data, err := os.ReadFile(args[i+1])
+				if err == nil {
+					joined += "\n" + string(data)
+				}
+			}
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		switch {
@@ -1556,4 +1576,46 @@ suites:
 	defer mu.Unlock()
 	assert.ElementsMatch(t, []string{"engine", "storage", "build"}, ran)
 	assert.Equal(t, "build", ran[len(ran)-1])
+}
+
+func TestDisallowedRegistry(t *testing.T) {
+	t.Setenv("GO_TEST", "1")
+	configPath := filepath.Join(t.TempDir(), "sonic.yml")
+	assert.NoError(t, os.WriteFile(configPath, []byte(`
+version: "1"
+project:
+  name: app
+stages:
+  build:
+    runner: alpine
+    commands: ["echo hi"]
+`), 0644))
+	original := lib.ExecDocker
+	t.Cleanup(func() { lib.ExecDocker = original })
+	lib.ExecDocker = func(args []string) lib.DockerResult {
+		t.Fatal("docker should not run")
+		return lib.DockerResult{}
+	}
+	err := run([]string{"gosonic", "--sonic-file", configPath, "--registry", "evil.example", "run", "build"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not allowed")
+}
+
+func TestUnsignedAuditLogDoesNotSatisfyRequires(t *testing.T) {
+	dir := t.TempDir()
+	store := lib.NewFileStore(dir, false)
+	unsigned := lib.AuditLog{
+		Project: "app", GitRevision: "abc", Stage: "scan", Status: "success",
+		StartTime: time.Now(),
+	}
+	data, err := json.Marshal(unsigned)
+	assert.NoError(t, err)
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "app-scan-unsigned.json"), data, 0600))
+	err = verifyRequirements(Stage{Requires: []string{"scan"}}, store, "app", "abc")
+	assert.Error(t, err)
+
+	signed := unsigned
+	signed.StartTime = unsigned.StartTime.Add(time.Second)
+	assert.NoError(t, store.Store(signed))
+	assert.NoError(t, verifyRequirements(Stage{Requires: []string{"scan"}}, store, "app", "abc"))
 }

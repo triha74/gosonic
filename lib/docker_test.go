@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -335,6 +336,17 @@ func TestExecuteStage(t *testing.T) {
 		},
 	}
 
+	user := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	for i := range tests {
+		tests[i].wantCommand = append([]string{
+			"docker", "run", "--rm", "--init", "--workdir", "/workspace",
+			"--user", user,
+			"--cap-drop", "ALL",
+			"--security-opt", "no-new-privileges",
+			"--pids-limit", "4096",
+		}, tests[i].wantCommand[6:]...)
+	}
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// Mock docker execution
@@ -408,11 +420,12 @@ func TestDockerRunOptions(t *testing.T) {
 	}
 
 	err := ExecuteStage(StageExecution{
-		Name:             "build",
-		Runner:           "alpine:latest",
-		Commands:         []string{"echo hi"},
-		WorkingDirectory: "/workspace/src",
-		DockerSocket:     true,
+		Name:              "build",
+		Runner:            "alpine:latest",
+		Commands:          []string{"echo hi"},
+		WorkingDirectory:  "/workspace/src",
+		DockerSocket:      true,
+		AllowDockerSocket: true,
 		Volumes: []Volume{{
 			Type:   "cache",
 			Source: "cargo registry",
@@ -738,6 +751,121 @@ func TestQuietExecuteStageCapturesFailure(t *testing.T) {
 	})
 	assert.NotContains(t, stdout, "Root dir")
 	assert.NotContains(t, stderr, "Root dir")
+}
+
+func TestEnvFileKeepsSecretsOffTheCommandLine(t *testing.T) {
+	t.Setenv("SUPER_SECRET", "s3cr3t-value")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
+	original := ExecDocker
+	defer func() { ExecDocker = original }()
+
+	var command string
+	var envBody string
+	ExecDocker = func(args []string) DockerResult {
+		command = strings.Join(args, " ")
+		for i, arg := range args {
+			if arg == "--env-file" && i+1 < len(args) {
+				data, err := os.ReadFile(args[i+1])
+				assert.NoError(t, err)
+				envBody = string(data)
+				info, err := os.Stat(args[i+1])
+				assert.NoError(t, err)
+				assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+			}
+		}
+		for _, arg := range args {
+			assert.NotEqual(t, "-e", arg)
+		}
+		return DockerResult{}
+	}
+
+	err := ExecuteStage(StageExecution{
+		Name:   "deploy",
+		Runner: "alpine:latest",
+		Commands: []string{
+			"echo ok",
+		},
+		Environment: map[string]string{
+			"FOO":                    "AWS_SECRET_ACCESS_KEY",
+			"GOSONIC_AUDIT_HMAC_KEY": "should-not-leak",
+		},
+		Secrets: []string{"SUPER_SECRET", "GOSONIC_AUDIT_HMAC_KEY"},
+	}, nil, "proj")
+	assert.NoError(t, err)
+	assert.NotContains(t, command, "s3cr3t-value")
+	assert.NotContains(t, command, "real-secret")
+	assert.NotContains(t, command, "should-not-leak")
+	assert.Contains(t, envBody, "FOO=AWS_SECRET_ACCESS_KEY")
+	assert.Contains(t, envBody, "SUPER_SECRET=s3cr3t-value")
+	assert.NotContains(t, envBody, "real-secret")
+	assert.NotContains(t, envBody, "should-not-leak")
+	assert.NotContains(t, envBody, "GOSONIC_AUDIT_HMAC_KEY")
+}
+
+func TestDockerSocketRequiresOptIn(t *testing.T) {
+	original := ExecDocker
+	defer func() { ExecDocker = original }()
+	called := false
+	ExecDocker = func(args []string) DockerResult {
+		called = true
+		return DockerResult{}
+	}
+	err := ExecuteStage(StageExecution{
+		Name:         "build",
+		Runner:       "alpine:latest",
+		Commands:     []string{"echo hi"},
+		DockerSocket: true,
+	}, nil, "proj")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "docker socket is not allowed")
+	assert.False(t, called)
+}
+
+func TestPublishedPortBindsLoopback(t *testing.T) {
+	assert.Equal(t, "127.0.0.1:5432:5432", publishedPort("5432:5432"))
+	assert.Equal(t, "127.0.0.1:5432", publishedPort("5432"))
+	assert.Equal(t, "127.0.0.1:5432:5432", publishedPort("127.0.0.1:5432:5432"))
+	assert.Equal(t, "0.0.0.0:80:80", publishedPort("0.0.0.0:80:80"))
+}
+
+func TestMountOfAuditKeyIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+	assert.NoError(t, os.WriteFile(keyPath, bytes.Repeat([]byte{9}, 32), 0600))
+	t.Setenv("GOSONIC_AUDIT_HMAC_KEY", "")
+	t.Setenv("GOSONIC_AUDIT_HMAC_KEY_FILE", keyPath)
+
+	original := ExecDocker
+	defer func() { ExecDocker = original }()
+	ExecDocker = func(args []string) DockerResult { return DockerResult{} }
+
+	err := ExecuteStage(StageExecution{
+		Name:     "build",
+		Runner:   "alpine:latest",
+		Commands: []string{"echo hi"},
+		Volumes:  []Volume{{Type: "bind", Source: dir, Target: "/keys"}},
+	}, nil, "proj")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "audit signing key")
+
+	assert.False(t, mountsAuditKey(".", keyPath))
+}
+
+func TestRegistryAllowlist(t *testing.T) {
+	assert.True(t, RegistryAllowed("public.ecr.aws", nil))
+	assert.True(t, RegistryAllowed("localhost:5000", nil))
+	assert.True(t, RegistryAllowed("evil.example", []string{"evil.example"}))
+	assert.False(t, RegistryAllowed("evil.example", nil))
+
+	err := ValidateImage("evil.example/app:latest", nil, false)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not allowed")
+
+	err = ValidateImage("public.ecr.aws/docker/library/alpine:latest", nil, true)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "digest")
+
+	assert.NoError(t, ValidateImage("public.ecr.aws/docker/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil, true))
 }
 
 func captureFD(t *testing.T, fn func()) (string, string) {

@@ -45,23 +45,21 @@ stages:
       DB_HOST: "localhost"
   package:
     runner: "docker"
+    # Host Docker access. Also pass --allow-docker-socket (or set
+    # GOSONIC_ALLOW_DOCKER_SOCKET=1). A hand-written socket bind is not gated.
+    docker_socket: true
     commands:
       - "docker build ."
     volumes:
       - type: bind
         source: "."
         target: "/workspace"
-      - type: bind
-        source: "/var/run/docker.sock"
-        target: "/var/run/docker.sock"
   publish:
     runner: "docker"
+    docker_socket: true
     commands:
       - "docker push"
     volumes:
-      - type: bind
-        source: "/var/run/docker.sock"
-        target: "/var/run/docker.sock"
       - type: bind
         source: "${HOME}/.docker/config.json"
         target: "/root/.docker/config.json"

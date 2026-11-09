@@ -11,6 +11,8 @@ stages:
     runner: "aws-cli/aws-cli:latest"
     commands:
       - "sts get-caller-identity --profile ${AWS_PROFILE}"
+    environment:
+      HOME: /root
     volumes:
       - type: bind
         source: "${HOME}/.aws/"
@@ -19,6 +21,8 @@ stages:
     runner: "aws-cli/aws-cli:latest"
     commands:
       - "s3 ls --profile ${AWS_PROFILE}"
+    environment:
+      HOME: /root
     volumes:
       - type: bind
         source: "${HOME}/.aws/"
@@ -27,6 +31,8 @@ stages:
     runner: "aws-cli/aws-cli:latest"
     commands:
       - "ec2 describe-instances --region ${AWS_REGION:-us-east-1} --profile ${AWS_PROFILE}"
+    environment:
+      HOME: /root
     volumes:
       - type: bind
         source: "${HOME}/.aws/"

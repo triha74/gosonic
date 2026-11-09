@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -39,6 +40,9 @@ func NewS3Store(client S3Client, bucketName string, prefix string, verbose bool)
 
 // Store implements AuditStore for S3Store
 func (s *S3Store) Store(log AuditLog) error {
+	if err := signLog(&log); err != nil {
+		return fmt.Errorf("signing audit log: %w", err)
+	}
 	data, err := log.marshalLog()
 	if err != nil {
 		return fmt.Errorf("marshaling audit log: %w", err)
@@ -137,6 +141,13 @@ func (s *S3Store) LoadLogs(project, gitRevision string) ([]AuditLog, error) {
 		if err := json.Unmarshal(data, &log); err != nil {
 			return nil, fmt.Errorf("parsing log file %s: %w", *obj.Key, err)
 		}
+		trusted, err := logTrusted(log)
+		if err != nil {
+			return nil, err
+		}
+		if !trusted {
+			continue
+		}
 
 		// Only include logs for the specified git revision
 		if log.GitRevision == gitRevision {
@@ -150,3 +161,76 @@ func (s *S3Store) LoadLogs(project, gitRevision string) ([]AuditLog, error) {
 
 	return logs, nil
 }
+
+// ListLogs reads every audit object for a project, across git revisions.
+// Listing follows ContinuationToken until the bucket page is exhausted.
+func (s *S3Store) ListLogs(project string) ([]AuditLog, error) {
+	prefix := project + "-"
+	if s.Prefix != "" {
+		prefix = filepath.Join(s.Prefix, prefix)
+	}
+
+	var logs []AuditLog
+	var token *string
+	for {
+		input := &s3.ListObjectsV2Input{
+			Bucket:            &s.BucketName,
+			Prefix:            &prefix,
+			ContinuationToken: token,
+		}
+		result, err := s.Client.ListObjectsV2(context.Background(), input)
+		if err != nil {
+			return nil, fmt.Errorf("listing objects in S3 bucket: %w", err)
+		}
+		for _, obj := range result.Contents {
+			if obj.Key == nil || !strings.HasSuffix(*obj.Key, ".json") {
+				continue
+			}
+			log, err := s.readLog(*obj.Key)
+			if errors.Is(err, errUntrustedLog) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if log.Project == project {
+				logs = append(logs, log)
+			}
+		}
+		if result.IsTruncated == nil || !*result.IsTruncated || result.NextContinuationToken == nil || *result.NextContinuationToken == "" {
+			break
+		}
+		token = result.NextContinuationToken
+	}
+	return logs, nil
+}
+
+func (s *S3Store) readLog(key string) (AuditLog, error) {
+	output, err := s.Client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: &s.BucketName,
+		Key:    &key,
+	})
+	if err != nil {
+		return AuditLog{}, fmt.Errorf("getting object from S3: %w", err)
+	}
+	defer output.Body.Close()
+	data, err := io.ReadAll(output.Body)
+	if err != nil {
+		return AuditLog{}, fmt.Errorf("reading object body: %w", err)
+	}
+	var log AuditLog
+	if err := json.Unmarshal(data, &log); err != nil {
+		return AuditLog{}, fmt.Errorf("parsing log file %s: %w", key, err)
+	}
+	trusted, err := logTrusted(log)
+	if err != nil {
+		return AuditLog{}, err
+	}
+	if !trusted {
+		return AuditLog{}, errUntrustedLog
+	}
+	return log, nil
+}
+
+// errUntrustedLog tells ListLogs to skip a record without aborting the page.
+var errUntrustedLog = fmt.Errorf("audit log signature is not valid")

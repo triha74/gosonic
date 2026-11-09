@@ -158,7 +158,7 @@ func validWorkflowName(name string) bool {
 
 func builtinCommand(name string) bool {
 	switch name {
-	case "run", "help", "verify-aws-creds":
+	case "run", "help", "verify-aws-creds", "graph":
 		return true
 	default:
 		return false
@@ -315,7 +315,7 @@ func stripFirstPositional(args []string) []string {
 // element. Command flags such as --jobs are not global.
 func globalFlag(arg string) (takesValue, known bool) {
 	switch arg {
-	case "--verbose", "--help", "-h":
+	case "--verbose", "--help", "-h", "--allow-docker-socket", "--require-image-digest":
 		return false, true
 	case "--sonic-file", "-f", "--var", "-v", "--audit-store", "--audit-path", "--audit-s3-bucket", "--registry":
 		return true, true
@@ -416,11 +416,12 @@ type Config struct {
 		S3Bucket   string `yaml:"s3bucket"`    // S3 bucket name if using S3
 		AWSProfile string `yaml:"aws_profile"` // AWS profile to use for S3
 	} `yaml:"audit"`
-	Runners Runners             `yaml:"runners,omitempty"`
-	Matrix  MatrixAxes          `yaml:"matrix,omitempty"`
-	Actions map[string]Action   `yaml:"actions,omitempty"`
-	Suites  map[string][]string `yaml:"suites,omitempty"`
-	Stages  map[string]Stage    `yaml:"stages"`
+	Runners           Runners             `yaml:"runners,omitempty"`
+	AllowedRegistries []string            `yaml:"allowed_registries,omitempty"`
+	Matrix            MatrixAxes          `yaml:"matrix,omitempty"`
+	Actions           map[string]Action   `yaml:"actions,omitempty"`
+	Suites            map[string][]string `yaml:"suites,omitempty"`
+	Stages            map[string]Stage    `yaml:"stages"`
 }
 
 // Runners maps an alias to a Docker image reference.
@@ -585,6 +586,9 @@ type Action struct {
 	Environment      map[string]string `yaml:"environment,omitempty"`
 	Volumes          []lib.Volume      `yaml:"volumes,omitempty"`
 	DockerSocket     bool              `yaml:"docker_socket,omitempty"`
+	Secrets          []string          `yaml:"secrets,omitempty"`
+	User             string            `yaml:"user,omitempty"`
+	PidsLimit        int               `yaml:"pids_limit,omitempty"`
 	Once             bool              `yaml:"once,omitempty"`
 	Timeout          string            `yaml:"timeout,omitempty"`
 	WorkingDirectory string            `yaml:"working_directory,omitempty"`
@@ -607,6 +611,9 @@ type Stage struct {
 	When             string            `yaml:"when,omitempty"`
 	WorkingDirectory string            `yaml:"working_directory,omitempty"`
 	DockerSocket     bool              `yaml:"docker_socket,omitempty"`
+	Secrets          []string          `yaml:"secrets,omitempty"`
+	User             string            `yaml:"user,omitempty"`
+	PidsLimit        int               `yaml:"pids_limit,omitempty"`
 	Services         []Service         `yaml:"services,omitempty"`
 	Matrix           []string          `yaml:"matrix,omitempty"`
 }
@@ -641,16 +648,46 @@ func resolveStageVars(stage *Stage, vars execVars) {
 		stage.Environment[k] = resolveVars(v, vars)
 	}
 
-	// Resolve volume paths
+	// Resolve volume paths. Commands stay literal so values are not spliced into the shell script.
 	for i, vol := range stage.Volumes {
 		stage.Volumes[i].Source = resolveVars(vol.Source, vars)
 		stage.Volumes[i].Target = resolveVars(vol.Target, vars)
 	}
+}
 
-	// Resolve commands
-	for i, cmd := range stage.Commands {
-		stage.Commands[i] = resolveVars(cmd, vars)
+func validEnvName(name string) bool {
+	if name == "" || lib.ProtectedEnv(name) {
+		return false
 	}
+	for i, r := range name {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r == '_':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// exportExecVars adds execution variables whose names are valid environment names.
+// The container shell expands $NAME. Explicit stage environment wins.
+func exportExecVars(env map[string]string, vars execVars) map[string]string {
+	if len(vars) == 0 {
+		return env
+	}
+	if env == nil {
+		env = map[string]string{}
+	}
+	for key, value := range vars {
+		if !validEnvName(key) {
+			continue
+		}
+		if _, exists := env[key]; !exists {
+			env[key] = value
+		}
+	}
+	return env
 }
 
 func loadConfig(path string, vars execVars) (*Config, error) {
@@ -781,10 +818,8 @@ func applyRunnerAliases(config *Config, vars execVars) {
 	}
 	for name, action := range config.Actions {
 		action.Runner = resolveRunnerName(action.Runner, config.Runners, vars)
-		for i, cmd := range action.Commands {
-			action.Commands[i] = resolveVars(cmd, vars)
-		}
 		action.WorkingDirectory = resolveVars(action.WorkingDirectory, vars)
+		action.Environment = exportExecVars(action.Environment, vars)
 		config.Actions[name] = action
 	}
 	for name, stage := range config.Stages {
@@ -793,9 +828,9 @@ func applyRunnerAliases(config *Config, vars execVars) {
 		stage.WorkingDirectory = resolveVars(stage.WorkingDirectory, vars)
 		stage.When = resolveVars(stage.When, vars)
 		for i, step := range stage.Steps {
-			stage.Steps[i].Run = resolveVars(step.Run, vars)
 			stage.Steps[i].When = resolveVars(step.When, vars)
 		}
+		stage.Environment = exportExecVars(stage.Environment, vars)
 		config.Stages[name] = stage
 	}
 }
@@ -900,8 +935,55 @@ func withoutRequires(stage Stage, skip map[string]bool) Stage {
 	return stage
 }
 
+func socketAllowed(ctx *cli.Context) bool {
+	if ctx != nil && ctx.Bool("allow-docker-socket") {
+		return true
+	}
+	switch strings.ToLower(os.Getenv("GOSONIC_ALLOW_DOCKER_SOCKET")) {
+	case "1", "true", "t", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func digestRequired(ctx *cli.Context) bool {
+	return ctx != nil && ctx.Bool("require-image-digest")
+}
+
+func selectedRegistry(ctx *cli.Context, config *Config) (string, error) {
+	registry := defaultRegistry
+	if ctx != nil {
+		if value := ctx.String("registry"); value != "" {
+			registry = value
+		}
+	}
+	if !lib.RegistryAllowed(registry, config.AllowedRegistries) {
+		return "", fmt.Errorf("default registry %q is not allowed", registry)
+	}
+	return registry, nil
+}
+
 func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, skipRequires map[string]bool, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, runCtx context.Context) error {
-	var err error
+	if stage.DockerSocket && !socketAllowed(ctx) {
+		return fmt.Errorf("stage %q sets docker_socket but the Docker socket is not allowed; pass --allow-docker-socket or set GOSONIC_ALLOW_DOCKER_SOCKET=1", name)
+	}
+	registry, err := selectedRegistry(ctx, config)
+	if err != nil {
+		return err
+	}
+	requireDigest := digestRequired(ctx)
+	runner := lib.ResolveRunnerImage(stage.Runner, registry)
+	if err := lib.ValidateImage(runner, config.AllowedRegistries, requireDigest); err != nil {
+		return err
+	}
+	for i, svc := range stage.Services {
+		stage.Services[i].Image = lib.ResolveRunnerImage(svc.Image, registry)
+		if err := lib.ValidateImage(stage.Services[i].Image, config.AllowedRegistries, requireDigest); err != nil {
+			return err
+		}
+	}
+
 	if auditStore == nil {
 		auditStore, err = createAuditStore(config, ctx)
 		if err != nil {
@@ -931,27 +1013,31 @@ func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, sk
 	for i, svc := range stage.Services {
 		services[i] = lib.ServiceSpec{
 			Name:        svc.Name,
-			Image:       lib.ResolveRunnerImage(svc.Image, defaultRegistry),
+			Image:       svc.Image,
 			Environment: svc.Environment,
 			Ports:       svc.Ports,
 		}
 	}
 
 	stageExec := lib.StageExecution{
-		Name:             name,
-		Runner:           lib.ResolveRunnerImage(stage.Runner, defaultRegistry),
-		Commands:         stage.Commands,
-		Shell:            stage.Shell,
-		Environment:      stage.Environment,
-		Volumes:          stage.Volumes,
-		Verbose:          ctx.Bool("verbose"),
-		PrefixOutput:     prefixOutput,
-		OutputLock:       outputMu,
-		WorkingDirectory: stage.WorkingDirectory,
-		Timeout:          timeout,
-		DockerSocket:     stage.DockerSocket,
-		Services:         services,
-		Context:          runCtx,
+		Name:              name,
+		Runner:            runner,
+		Commands:          stage.Commands,
+		Shell:             stage.Shell,
+		Environment:       stage.Environment,
+		Volumes:           stage.Volumes,
+		Verbose:           ctx.Bool("verbose"),
+		PrefixOutput:      prefixOutput,
+		OutputLock:        outputMu,
+		WorkingDirectory:  stage.WorkingDirectory,
+		Timeout:           timeout,
+		DockerSocket:      stage.DockerSocket,
+		AllowDockerSocket: socketAllowed(ctx),
+		Secrets:           stage.Secrets,
+		User:              stage.User,
+		PidsLimit:         stage.PidsLimit,
+		Services:          services,
+		Context:           runCtx,
 	}
 
 	return lib.ExecuteStage(stageExec, auditStore, config.Project.Name)
@@ -1142,6 +1228,15 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 			Value:   false,
 			EnvVars: []string{"GOSONIC_VERBOSE"},
 		},
+		&cli.BoolFlag{
+			Name:    "allow-docker-socket",
+			Usage:   "Allow stages to mount the Docker socket",
+			EnvVars: []string{"GOSONIC_ALLOW_DOCKER_SOCKET"},
+		},
+		&cli.BoolFlag{
+			Name:  "require-image-digest",
+			Usage: "Fail when an image has no @sha256 digest",
+		},
 	}
 
 	// Load config and create commands immediately. A leading workflow name is
@@ -1190,6 +1285,7 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 	var config *Config
 	var err error
 	config, err = loadConfig(configPath, vars)
+	loadErr := err
 	if err != nil {
 		config = &Config{} // Use empty config if loading fails
 	}
@@ -1318,6 +1414,8 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 			})
 		}
 	}
+
+	commands = append(commands, graphCommand(config, workflowGraphName(inv.workflow, configPath), loadErr))
 
 	// Add this to the commands slice in the run function
 	commands = append(commands, &cli.Command{

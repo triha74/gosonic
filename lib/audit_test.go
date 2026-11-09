@@ -2,6 +2,7 @@ package lib
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"os"
@@ -14,6 +15,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv(auditKeyEnv) == "" {
+		os.Setenv(auditKeyEnv, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	}
+	os.Exit(m.Run())
+}
 
 // Mock command execution
 var mockExecCommand = exec.Command
@@ -56,7 +64,12 @@ func TestFileStore(t *testing.T) {
 		assert.Len(t, files, 1)
 
 		// Read and verify content
-		content, err := os.ReadFile(filepath.Join(store.Directory, files[0].Name()))
+		logPath := filepath.Join(store.Directory, files[0].Name())
+		info, err := os.Stat(logPath)
+		assert.NoError(t, err)
+		assert.Equal(t, os.FileMode(0600), info.Mode().Perm())
+
+		content, err := os.ReadFile(logPath)
 		assert.NoError(t, err)
 
 		var readLog AuditLog
@@ -66,6 +79,44 @@ func TestFileStore(t *testing.T) {
 		assert.Equal(t, log.Stage, readLog.Stage)
 		assert.Equal(t, log.Status, readLog.Status)
 	})
+}
+
+func TestTamperedAuditLogIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir, false)
+	log := AuditLog{
+		Project:     "app",
+		GitRevision: "abc",
+		Stage:       "scan",
+		Status:      "success",
+		StartTime:   time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC),
+	}
+	assert.NoError(t, store.Store(log))
+
+	entries, err := os.ReadDir(dir)
+	assert.NoError(t, err)
+	assert.Len(t, entries, 1)
+	path := filepath.Join(dir, entries[0].Name())
+	data, err := os.ReadFile(path)
+	assert.NoError(t, err)
+	data = bytes.Replace(data, []byte(`"success"`), []byte(`"failure"`), 1)
+	assert.NoError(t, os.WriteFile(path, data, 0600))
+
+	logs, err := store.LoadLogs("app", "abc")
+	assert.NoError(t, err)
+	assert.Empty(t, logs)
+}
+
+func TestAuditKeyFileMustBePrivate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.key")
+	assert.NoError(t, os.WriteFile(path, bytes.Repeat([]byte{9}, 32), 0644))
+	t.Setenv(auditKeyEnv, "")
+	t.Setenv(auditKeyFileEnv, path)
+
+	_, _, err := loadAuditKey()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "must not be readable")
 }
 
 func TestFileStoreNanosecondFilenames(t *testing.T) {
