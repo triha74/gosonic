@@ -158,7 +158,7 @@ func validWorkflowName(name string) bool {
 
 func builtinCommand(name string) bool {
 	switch name {
-	case "run", "help", "verify-aws-creds", "graph":
+	case "run", "help", "verify-aws-creds":
 		return true
 	default:
 		return false
@@ -1285,7 +1285,6 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 	var config *Config
 	var err error
 	config, err = loadConfig(configPath, vars)
-	loadErr := err
 	if err != nil {
 		config = &Config{} // Use empty config if loading fails
 	}
@@ -1414,8 +1413,6 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 			})
 		}
 	}
-
-	commands = append(commands, graphCommand(config, workflowGraphName(inv.workflow, configPath), loadErr))
 
 	// Add this to the commands slice in the run function
 	commands = append(commands, &cli.Command{
