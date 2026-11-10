@@ -278,32 +278,28 @@ type ServiceSpec struct {
 
 // StageExecution represents the configuration needed to execute a stage
 type StageExecution struct {
-	Name              string
-	Runner            string
-	Commands          []string
-	Shell             string
-	Environment       map[string]string
-	Volumes           []Volume
-	Verbose           bool
-	PrefixOutput      bool
-	OutputLock        *sync.Mutex
-	WorkingDirectory  string
-	Timeout           time.Duration
-	DockerSocket      bool
-	AllowDockerSocket bool
-	Secrets           []string
-	OptionalSecrets   []string
-	User              string
-	PidsLimit         int
-	Services          []ServiceSpec
-	Context           context.Context
+	Name             string
+	Runner           string
+	Commands         []string
+	Shell            string
+	Environment      map[string]string
+	Volumes          []Volume
+	Verbose          bool
+	PrefixOutput     bool
+	OutputLock       *sync.Mutex
+	WorkingDirectory string
+	Timeout          time.Duration
+	DockerSocket     bool
+	Secrets          []string
+	OptionalSecrets  []string
+	User             string
+	PidsLimit        int
+	Services         []ServiceSpec
+	Context          context.Context
 }
 
 // ExecuteStage runs a stage in a docker container and handles audit logging
 func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName string) error {
-	if stage.DockerSocket && !stage.AllowDockerSocket {
-		return fmt.Errorf("docker socket is not allowed; pass --allow-docker-socket or set GOSONIC_ALLOW_DOCKER_SOCKET=1")
-	}
 	startTime := time.Now()
 
 	// Get git revision
@@ -516,9 +512,6 @@ func containerShell(name string) string {
 }
 
 func buildDockerArgs(stage StageExecution, network, envFile string) ([]string, error) {
-	if stage.DockerSocket && !stage.AllowDockerSocket {
-		return nil, fmt.Errorf("docker socket is not allowed; pass --allow-docker-socket or set GOSONIC_ALLOW_DOCKER_SOCKET=1")
-	}
 	workdir := stage.WorkingDirectory
 	if workdir == "" {
 		workdir = "/workspace"
@@ -592,7 +585,7 @@ func containerIdentity(stage StageExecution) (string, []string) {
 		user = fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
 	}
 	var groups []string
-	if stage.DockerSocket && stage.AllowDockerSocket {
+	if stage.DockerSocket {
 		if gid, err := dockerSocketGroup(); err == nil && gid != "" {
 			groups = append(groups, gid)
 		}

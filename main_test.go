@@ -1620,20 +1620,6 @@ func TestUnsignedAuditLogDoesNotSatisfyRequires(t *testing.T) {
 	assert.NoError(t, verifyRequirements(Stage{Requires: []string{"scan"}}, store, "app", "abc"))
 }
 
-func TestSocketRefusedUnlessAllowed(t *testing.T) {
-	t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", "")
-	assert.False(t, socketAllowed(nil))
-
-	for _, value := range []string{"1", "true", "t", "yes"} {
-		t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", value)
-		assert.True(t, socketAllowed(nil), value)
-	}
-	for _, value := range []string{"0", "false", "no", "fasle"} {
-		t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", value)
-		assert.False(t, socketAllowed(nil), value)
-	}
-}
-
 func TestActionAcceptsOptionalSecrets(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "ci.yml")

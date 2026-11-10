@@ -449,12 +449,11 @@ func TestDockerRunOptions(t *testing.T) {
 	}
 
 	err := ExecuteStage(StageExecution{
-		Name:              "build",
-		Runner:            "alpine:latest",
-		Commands:          []string{"echo hi"},
-		WorkingDirectory:  "/workspace/src",
-		DockerSocket:      true,
-		AllowDockerSocket: true,
+		Name:             "build",
+		Runner:           "alpine:latest",
+		Commands:         []string{"echo hi"},
+		WorkingDirectory: "/workspace/src",
+		DockerSocket:     true,
 		Volumes: []Volume{{
 			Type:   "cache",
 			Source: "cargo registry",
@@ -831,12 +830,12 @@ func TestEnvFileKeepsSecretsOffTheCommandLine(t *testing.T) {
 	assert.NotContains(t, envBody, "GOSONIC_AUDIT_HMAC_KEY")
 }
 
-func TestDockerSocketRequiresOptIn(t *testing.T) {
+func TestDockerSocketMountsWhenTheStageSetsIt(t *testing.T) {
 	original := ExecDocker
 	defer func() { ExecDocker = original }()
-	called := false
-	ExecDocker = func(args []string) DockerResult {
-		called = true
+	var args []string
+	ExecDocker = func(got []string) DockerResult {
+		args = append([]string{}, got...)
 		return DockerResult{}
 	}
 	err := ExecuteStage(StageExecution{
@@ -845,9 +844,8 @@ func TestDockerSocketRequiresOptIn(t *testing.T) {
 		Commands:     []string{"echo hi"},
 		DockerSocket: true,
 	}, nil, "proj")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "docker socket is not allowed")
-	assert.False(t, called)
+	assert.NoError(t, err)
+	assert.Contains(t, args, "/var/run/docker.sock:/var/run/docker.sock")
 }
 
 func TestPublishedPortBindsLoopback(t *testing.T) {

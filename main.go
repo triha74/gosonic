@@ -315,7 +315,7 @@ func stripFirstPositional(args []string) []string {
 // element. Command flags such as --jobs are not global.
 func globalFlag(arg string) (takesValue, known bool) {
 	switch arg {
-	case "--verbose", "--help", "-h", "--allow-docker-socket", "--require-image-digest":
+	case "--verbose", "--help", "-h", "--require-image-digest":
 		return false, true
 	case "--sonic-file", "-f", "--var", "-v", "--audit-store", "--audit-path", "--audit-s3-bucket", "--registry":
 		return true, true
@@ -937,22 +937,6 @@ func withoutRequires(stage Stage, skip map[string]bool) Stage {
 	return stage
 }
 
-// socketAllowed reports whether stages may mount the Docker socket.
-// A stage still has to set docker_socket: true. The mount stays off unless
-// this run passes --allow-docker-socket or sets GOSONIC_ALLOW_DOCKER_SOCKET
-// to 1, true, t, or yes. An empty value and any other value refuse the mount.
-func socketAllowed(ctx *cli.Context) bool {
-	if ctx != nil && ctx.Bool("allow-docker-socket") {
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOSONIC_ALLOW_DOCKER_SOCKET"))) {
-	case "1", "true", "t", "yes":
-		return true
-	default:
-		return false
-	}
-}
-
 func digestRequired(ctx *cli.Context) bool {
 	return ctx != nil && ctx.Bool("require-image-digest")
 }
@@ -971,9 +955,6 @@ func selectedRegistry(ctx *cli.Context, config *Config) (string, error) {
 }
 
 func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, skipRequires map[string]bool, prefixOutput bool, outputMu *sync.Mutex, auditStore lib.AuditStore, runCtx context.Context) error {
-	if stage.DockerSocket && !socketAllowed(ctx) {
-		return fmt.Errorf("stage %q sets docker_socket but the Docker socket is not allowed; pass --allow-docker-socket or set GOSONIC_ALLOW_DOCKER_SOCKET=1", name)
-	}
 	registry, err := selectedRegistry(ctx, config)
 	if err != nil {
 		return err
@@ -1026,25 +1007,24 @@ func executeStage(ctx *cli.Context, name string, stage Stage, config *Config, sk
 	}
 
 	stageExec := lib.StageExecution{
-		Name:              name,
-		Runner:            runner,
-		Commands:          stage.Commands,
-		Shell:             stage.Shell,
-		Environment:       stage.Environment,
-		Volumes:           stage.Volumes,
-		Verbose:           ctx.Bool("verbose"),
-		PrefixOutput:      prefixOutput,
-		OutputLock:        outputMu,
-		WorkingDirectory:  stage.WorkingDirectory,
-		Timeout:           timeout,
-		DockerSocket:      stage.DockerSocket,
-		AllowDockerSocket: socketAllowed(ctx),
-		Secrets:           stage.Secrets,
-		OptionalSecrets:   stage.OptionalSecrets,
-		User:              stage.User,
-		PidsLimit:         stage.PidsLimit,
-		Services:          services,
-		Context:           runCtx,
+		Name:             name,
+		Runner:           runner,
+		Commands:         stage.Commands,
+		Shell:            stage.Shell,
+		Environment:      stage.Environment,
+		Volumes:          stage.Volumes,
+		Verbose:          ctx.Bool("verbose"),
+		PrefixOutput:     prefixOutput,
+		OutputLock:       outputMu,
+		WorkingDirectory: stage.WorkingDirectory,
+		Timeout:          timeout,
+		DockerSocket:     stage.DockerSocket,
+		Secrets:          stage.Secrets,
+		OptionalSecrets:  stage.OptionalSecrets,
+		User:             stage.User,
+		PidsLimit:        stage.PidsLimit,
+		Services:         services,
+		Context:          runCtx,
 	}
 
 	return lib.ExecuteStage(stageExec, auditStore, config.Project.Name)
@@ -1234,11 +1214,6 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 			Usage:   "Enable verbose output",
 			Value:   false,
 			EnvVars: []string{"GOSONIC_VERBOSE"},
-		},
-		&cli.BoolFlag{
-			Name:    "allow-docker-socket",
-			Usage:   "Allow stages and actions that set docker_socket to mount the host socket",
-			EnvVars: []string{"GOSONIC_ALLOW_DOCKER_SOCKET"},
 		},
 		&cli.BoolFlag{
 			Name:  "require-image-digest",

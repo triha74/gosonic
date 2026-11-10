@@ -45,8 +45,7 @@ stages:
       DB_HOST: "localhost"
   package:
     runner: "docker"
-    # Host Docker access. Also pass --allow-docker-socket (or set
-    # GOSONIC_ALLOW_DOCKER_SOCKET=1). A hand-written socket bind is not gated.
+    # Host Docker access. A hand-written socket bind under volumes is not gated.
     docker_socket: true
     commands:
       - "docker build ."
