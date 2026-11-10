@@ -97,7 +97,6 @@ func TestOnceActionRunsOnce(t *testing.T) {
 			Before:   []HookRef{{Uses: "build-image"}},
 		}
 	}
-	t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", "1")
 	gate := &actionOnce{}
 	var wg sync.WaitGroup
 	wg.Add(2)
