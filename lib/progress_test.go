@@ -67,6 +67,41 @@ func TestProgressFinishNonTTYHasNoSpinner(t *testing.T) {
 	assert.False(t, containsSpinnerFrame(stdout))
 }
 
+func TestSingleStageSpinnerRedrawsInPlace(t *testing.T) {
+	originalTTY := stdoutIsTTY
+	stdoutIsTTY = func() bool { return true }
+	t.Cleanup(func() { stdoutIsTTY = originalTTY })
+
+	stdout, _ := captureFD(t, func() {
+		set := NewProgressSet(false, false, "lint")
+		lint := set.Start("lint")
+		time.Sleep(200 * time.Millisecond)
+		set.Finish(lint, "ok", nil)
+		set.Close()
+	})
+	assert.Contains(t, stdout, "\r")
+	assert.Contains(t, stdout, "lint             ok")
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	assert.Equal(t, 1, len(lines))
+}
+
+func TestNoteLeavesTheSpinnerOnItsOwnLine(t *testing.T) {
+	originalTTY := stdoutIsTTY
+	stdoutIsTTY = func() bool { return true }
+	t.Cleanup(func() { stdoutIsTTY = originalTTY })
+
+	stdout, stderr := captureFD(t, func() {
+		set := NewProgressSet(false, false, "lint")
+		defer set.Close()
+		set.Start("lint")
+		note("warning: image alpine:latest has no @sha256 digest")
+		set.Close()
+	})
+	assert.Equal(t, "warning: image alpine:latest has no @sha256 digest\n", stderr)
+	assert.NotContains(t, stdout, "warning:")
+	assert.NotContains(t, stderr, "lint")
+}
+
 func TestVerboseProgressIsSilent(t *testing.T) {
 	stdout, _ := captureFD(t, func() {
 		p := StartProgress("lint", true, false, nil)

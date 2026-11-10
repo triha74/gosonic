@@ -263,7 +263,7 @@ func ValidateImage(image string, extra []string, requireDigest bool) error {
 		return fmt.Errorf("image %s has no @sha256 digest", image)
 	}
 	if _, loaded := warnedDigests.LoadOrStore(image, true); !loaded {
-		fmt.Fprintf(os.Stderr, "warning: image %s has no @sha256 digest\n", image)
+		note("warning: image " + image + " has no @sha256 digest")
 	}
 	return nil
 }

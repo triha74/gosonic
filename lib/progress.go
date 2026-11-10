@@ -71,10 +71,40 @@ type ProgressSet struct {
 	mu     sync.Mutex
 	live   []*Progress
 	drawn  int
+	inline bool // the spinner is on the current line and has not printed a newline
 	frame  int
 	stop   chan struct{}
 	done   chan struct{}
 	closed bool
+}
+
+// active is the set currently drawing, so a warning can leave the spinner
+// line before it prints.
+var (
+	activeMu sync.Mutex
+	active   *ProgressSet
+)
+
+// note prints a line of its own. When a spinner is on the current line, it
+// clears that line first and draws the spinner again underneath.
+func note(line string) {
+	activeMu.Lock()
+	s := active
+	activeMu.Unlock()
+	if s == nil {
+		fmt.Fprintln(os.Stderr, line)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inline {
+		fmt.Fprint(os.Stdout, clearLine)
+		s.inline = false
+	} else {
+		s.eraseLiveLocked()
+	}
+	fmt.Fprintln(os.Stderr, line)
+	s.drawLiveLocked()
 }
 
 // Progress is one stage's quiet status line.
@@ -102,6 +132,9 @@ func NewProgressSet(verbose, prefix bool, names ...string) *ProgressSet {
 		s.done = make(chan struct{})
 		go s.loop()
 	}
+	activeMu.Lock()
+	active = s
+	activeMu.Unlock()
 	return s
 }
 
@@ -128,14 +161,19 @@ func (s *ProgressSet) Close() {
 		return
 	}
 	s.mu.Lock()
-	if s.closed || s.stop == nil {
-		s.mu.Unlock()
-		return
-	}
+	already := s.closed
 	s.closed = true
-	close(s.stop)
+	stop := s.stop
 	s.mu.Unlock()
-	<-s.done
+	if !already && stop != nil {
+		close(stop)
+		<-s.done
+	}
+	activeMu.Lock()
+	if active == s {
+		active = nil
+	}
+	activeMu.Unlock()
 }
 
 // Start adds a spinner line as soon as the stage begins.
@@ -157,9 +195,8 @@ func (s *ProgressSet) Finish(p *Progress, status string, err error) {
 		return
 	}
 	s.mu.Lock()
-	s.eraseLiveLocked()
 	s.removeLiveLocked(p)
-	fmt.Fprintln(os.Stdout, s.statusLine(p.name, status, time.Since(p.start)))
+	s.commitLineLocked(s.statusLine(p.name, status, time.Since(p.start)))
 	if !errors.Is(err, context.Canceled) {
 		writeCapturedOutputLocked(p.name, err, s.prefix)
 	}
@@ -183,7 +220,12 @@ func (s *ProgressSet) Summarize(err error) {
 		status = "failed"
 	}
 	s.mu.Lock()
-	s.eraseLiveLocked()
+	if s.inline {
+		fmt.Fprintln(os.Stdout)
+		s.inline = false
+	} else {
+		s.eraseLiveLocked()
+	}
 	fmt.Fprintln(os.Stdout)
 	fmt.Fprintln(os.Stdout, s.statusLine("run", status, time.Since(s.started)))
 	s.mu.Unlock()
@@ -195,8 +237,7 @@ func (s *ProgressSet) Skip(name string) {
 		return
 	}
 	s.mu.Lock()
-	s.eraseLiveLocked()
-	fmt.Fprintln(os.Stdout, s.statusLine(name, "skipped", 0))
+	s.commitLineLocked(s.statusLine(name, "skipped", 0))
 	s.drawLiveLocked()
 	s.mu.Unlock()
 }
@@ -224,14 +265,42 @@ func (s *ProgressSet) eraseLiveLocked() {
 	s.drawn = 0
 }
 
-func (s *ProgressSet) drawLiveLocked() {
-	if !s.tty {
+// commitLineLocked ends the current status row. A single-stage spinner has
+// been redrawn with carriage returns, so the final text replaces that row.
+func (s *ProgressSet) commitLineLocked(line string) {
+	if s.inline {
+		fmt.Fprintf(os.Stdout, "\r%s%s\n", line, clearToEnd)
+		s.inline = false
 		return
+	}
+	s.eraseLiveLocked()
+	fmt.Fprintln(os.Stdout, line)
+}
+
+func (s *ProgressSet) drawLiveLocked() {
+	if !s.tty || len(s.live) == 0 {
+		return
+	}
+	frame := spinnerFrames[s.frame%len(spinnerFrames)]
+	// One stage stays on the line it started on. Printing a newline and
+	// moving the cursor back up leaves the earlier frames on screen in
+	// terminals that do not honor that cursor move.
+	if len(s.live) == 1 {
+		if s.drawn > 0 {
+			s.eraseLiveLocked()
+		}
+		fmt.Fprintf(os.Stdout, "\r%s%s", s.liveLine(s.live[0], frame), clearToEnd)
+		s.inline = true
+		return
+	}
+	if s.inline {
+		fmt.Fprintln(os.Stdout)
+		s.inline = false
+		s.drawn = 1
 	}
 	if s.drawn > 0 {
 		fmt.Fprintf(os.Stdout, cursorUp, s.drawn)
 	}
-	frame := spinnerFrames[s.frame%len(spinnerFrames)]
 	for _, p := range s.live {
 		fmt.Fprintf(os.Stdout, "\r%s%s\n", s.liveLine(p, frame), clearToEnd)
 	}
