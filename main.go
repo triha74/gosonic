@@ -937,16 +937,16 @@ func withoutRequires(stage Stage, skip map[string]bool) Stage {
 	return stage
 }
 
-// socketAllowed reports whether stages may mount the Docker socket. It is
-// allowed by default. Set GOSONIC_ALLOW_DOCKER_SOCKET to 0 or false to turn
-// it off. Any other value that is not a recognized "on" value also turns it
-// off, so a typo fails closed.
+// socketAllowed reports whether stages may mount the Docker socket.
+// A stage still has to set docker_socket: true. The mount stays off unless
+// this run passes --allow-docker-socket or sets GOSONIC_ALLOW_DOCKER_SOCKET
+// to 1, true, t, or yes. An empty value and any other value refuse the mount.
 func socketAllowed(ctx *cli.Context) bool {
 	if ctx != nil && ctx.Bool("allow-docker-socket") {
 		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOSONIC_ALLOW_DOCKER_SOCKET"))) {
-	case "", "1", "true", "t", "yes":
+	case "1", "true", "t", "yes":
 		return true
 	default:
 		return false
@@ -1237,7 +1237,7 @@ With no name, gosonic uses .sonic/sonic.yml, then .sonic.yml, then the only *.ym
 		},
 		&cli.BoolFlag{
 			Name:    "allow-docker-socket",
-			Usage:   "Allow stages to mount the Docker socket (on by default; set to 0 or false to disable)",
+			Usage:   "Allow stages and actions that set docker_socket to mount the host socket",
 			EnvVars: []string{"GOSONIC_ALLOW_DOCKER_SOCKET"},
 		},
 		&cli.BoolFlag{

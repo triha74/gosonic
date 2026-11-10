@@ -1620,11 +1620,11 @@ func TestUnsignedAuditLogDoesNotSatisfyRequires(t *testing.T) {
 	assert.NoError(t, verifyRequirements(Stage{Requires: []string{"scan"}}, store, "app", "abc"))
 }
 
-func TestSocketAllowedByDefault(t *testing.T) {
+func TestSocketRefusedUnlessAllowed(t *testing.T) {
 	t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", "")
-	assert.True(t, socketAllowed(nil))
+	assert.False(t, socketAllowed(nil))
 
-	for _, value := range []string{"1", "true", "yes"} {
+	for _, value := range []string{"1", "true", "t", "yes"} {
 		t.Setenv("GOSONIC_ALLOW_DOCKER_SOCKET", value)
 		assert.True(t, socketAllowed(nil), value)
 	}
