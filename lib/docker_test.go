@@ -900,6 +900,53 @@ func captureFD(t *testing.T, fn func()) (string, string) {
 	return <-outC, <-errC
 }
 
+func TestHostUserGetsTmpHome(t *testing.T) {
+	path, err := writeEnvFile(stageEnvironment(StageExecution{
+		Environment: map[string]string{"FOO": "bar"},
+	}), nil, nil)
+	assert.NoError(t, err)
+	defer os.Remove(path)
+
+	data, err := os.ReadFile(path)
+	assert.NoError(t, err)
+	assert.Equal(t, "FOO=bar\nHOME=/tmp\n", string(data))
+}
+
+func TestHostUserWithNoEnvironmentStillGetsHome(t *testing.T) {
+	path, err := writeEnvFile(stageEnvironment(StageExecution{}), nil, nil)
+	assert.NoError(t, err)
+	defer os.Remove(path)
+
+	data, err := os.ReadFile(path)
+	assert.NoError(t, err)
+	assert.Equal(t, "HOME=/tmp\n", string(data))
+}
+
+func TestExplicitHomeWinsOverDefault(t *testing.T) {
+	path, err := writeEnvFile(stageEnvironment(StageExecution{
+		Environment: map[string]string{"HOME": "/root"},
+	}), nil, nil)
+	assert.NoError(t, err)
+	defer os.Remove(path)
+
+	data, err := os.ReadFile(path)
+	assert.NoError(t, err)
+	assert.Equal(t, "HOME=/root\n", string(data))
+}
+
+func TestNamedUserDoesNotGetDefaultHome(t *testing.T) {
+	path, err := writeEnvFile(stageEnvironment(StageExecution{
+		User:        "root",
+		Environment: map[string]string{"FOO": "bar"},
+	}), nil, nil)
+	assert.NoError(t, err)
+	defer os.Remove(path)
+
+	data, err := os.ReadFile(path)
+	assert.NoError(t, err)
+	assert.Equal(t, "FOO=bar\n", string(data))
+}
+
 func TestEnvFileValuesAreLiteral(t *testing.T) {
 	path, err := writeEnvFile(map[string]string{
 		"SPACED":  "a b",
