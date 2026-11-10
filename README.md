@@ -366,7 +366,7 @@ volumes:
 
 `actions` defines reusable bodies. A stage runs an action from `before`, `steps`, or `after`.
 
-- An action with `runner` is its own container. Set `docker_socket: true` when that container should talk to the host Docker daemon, for example to `docker build` an image that later stages run. The socket is allowed by default. Set `GOSONIC_ALLOW_DOCKER_SOCKET=0` to turn it off.
+- An action with `runner` is its own container. Set `docker_socket: true` on that action when it should talk to the host Docker daemon, for example to `docker build` an image that later stages run. The socket is not mounted unless the action or stage sets `docker_socket: true` and the run passes `--allow-docker-socket` or `GOSONIC_ALLOW_DOCKER_SOCKET=1`.
 - An action without `runner` is a command fragment. Its commands run inside the calling stage's container.
 - `before` must succeed before the stage body starts. `after` defaults to `when: always`, so it also runs when the stage fails. The stage failure is still returned.
 - `once: true` runs that action at most once per `gosonic run`. Every stage that lists it waits for that single run, including under `--jobs`.
@@ -404,7 +404,7 @@ Other stage fields:
 - `artifacts`: after a successful stage, copy these workspace-relative paths to `.sonic-artifacts/<stage>/`. A missing path fails the stage. A path that leaves the workspace, including through a symlink, is rejected.
 - `coverage`: when `enabled` is true, read `file` from inside the workspace. `format: percent` reads a number; `format: go` reads a Go cover profile. The stage fails when the percentage is below `threshold`.
 - `when`: skip the stage unless the expression matches. Supported forms are `env:NAME`, `env:NAME=value`, and a leading `!`. A skipped stage is audited as `skipped` and satisfies `requires`. The same expressions gate `after` actions, along with `always`, `success`, and `failure`.
-- `docker_socket`: bind-mount `/var/run/docker.sock` for this stage. Ignored when the socket is turned off with `GOSONIC_ALLOW_DOCKER_SOCKET=0` or `false`. The socket's group is added so a non-root user can use it. A volume entry that mounts the socket path directly is not covered by this flag.
+- `docker_socket`: set `true` on each stage or action that should bind-mount `/var/run/docker.sock`. Omit it and the socket is not mounted. The run also has to pass `--allow-docker-socket` or set `GOSONIC_ALLOW_DOCKER_SOCKET=1`. When both are set, the socket's group is added so a non-root user can use it. A volume entry that mounts the socket path directly is not covered by this field.
 - `secrets`: environment variable names. gosonic reads each value from its own environment and drops `GOSONIC_AUDIT_HMAC_KEY` and `GOSONIC_AUDIT_HMAC_KEY_FILE` if they appear here. A name that is not set fails the stage.
 - `optional_secrets`: same as `secrets`, but an unset name is passed as an empty value. Use it for values that a stage can do without.
 - `user`: replaces the default `--user <host-uid>:<host-gid>`. Use `root` only when the image has to. The host-uid default also sets `HOME=/tmp` unless the stage sets `HOME`. A named user does not.
@@ -483,8 +483,9 @@ GLOBAL OPTIONS:
                                    Default: "public.ecr.aws"
                                    Environment: GOSONIC_DEFAULT_REGISTRY
 
-   --allow-docker-socket           Allow stages and actions that set docker_socket (on by default;
-                                   set GOSONIC_ALLOW_DOCKER_SOCKET=0 to disable)
+   --allow-docker-socket           Allow stages and actions that set docker_socket to mount
+                                   the host socket. Off unless this flag or
+                                   GOSONIC_ALLOW_DOCKER_SOCKET=1 is set
                                    Environment: GOSONIC_ALLOW_DOCKER_SOCKET
 
    --require-image-digest          Fail when an image has no @sha256 digest
@@ -505,7 +506,7 @@ All command line flags can also be set using environment variables:
 - `SONIC_AUDIT_PATH`: Path for audit logs
 - `SONIC_AUDIT_S3_BUCKET`: S3 bucket for audit logs
 - `GOSONIC_DEFAULT_REGISTRY`: Default Docker registry. The host must be on the allowlist
-- `GOSONIC_ALLOW_DOCKER_SOCKET`: Allows `docker_socket`. Allowed when unset. Set to `0` or `false` to disable it. Any other value disables it
+- `GOSONIC_ALLOW_DOCKER_SOCKET`: Set to `1`, `true`, `t`, or `yes` to allow stages and actions that set `docker_socket: true` to mount the host socket. Unset, `0`, `false`, and any other value refuse the mount
 - `GOSONIC_VERBOSE`: Enable verbose output
 - `GOSONIC_AUDIT_HMAC_KEY`: Base64 signing key, at least 32 bytes after decoding. Takes precedence over the key file
 - `GOSONIC_AUDIT_HMAC_KEY_FILE`: Path to a raw key file of at least 32 bytes. When neither this nor `GOSONIC_AUDIT_HMAC_KEY` is set, gosonic creates `~/.config/gosonic/audit.key`
@@ -1012,7 +1013,7 @@ There is no default memory limit. A compiler or test runner that needs more than
 
 The workspace is mounted read-write so the stage can write build output. On top of a workspace bind, `.git` and `.sonic` are mounted read-only, so the container cannot install a git hook or rewrite the workflow that later stages will load. Cache and tmp volumes are unchanged.
 
-`docker_socket: true` mounts the host Docker socket, which is root on the host for anyone who can use it. gosonic adds that mount by default. Set `GOSONIC_ALLOW_DOCKER_SOCKET=0` (or `false`) to refuse it. When the mount is allowed, the socket's group is added so the non-root user can open it. A stage that is allowed the socket can read the signing key off the host filesystem. Treat that opt-in as a break in the audit signature guarantee. Writing the socket path yourself under `volumes` is not gated by the flag. Prefer `docker_socket`.
+`docker_socket: true` on a stage or action mounts the host Docker socket, which is root on the host for anyone who can use it. Set that field on each stage or action that needs the daemon. A stage that omits it does not get the socket. The run also has to pass `--allow-docker-socket` or set `GOSONIC_ALLOW_DOCKER_SOCKET=1`. When both are set, the socket's group is added so the non-root user can open it. A stage that is allowed the socket can read the signing key off the host filesystem. Treat that opt-in as a break in the audit signature guarantee. Writing the socket path yourself under `volumes` is not gated by the flag. Prefer `docker_socket`.
 
 Service `ports` are published on `127.0.0.1` unless the spec already includes an address. `5432:5432` becomes `127.0.0.1:5432:5432`. `0.0.0.0:5432:5432` stays reachable on every interface.
 
