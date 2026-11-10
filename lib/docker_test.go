@@ -349,10 +349,12 @@ func TestExecuteStage(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// Mock docker execution
+			// Mock docker execution. The host-uid default writes HOME=/tmp
+			// to a temp env file, so the path is not part of the expected argv.
 			ExecDocker = func(args []string) DockerResult {
-				// Verify command structure
-				assert.Equal(t, tc.wantCommand, args)
+				got, envBody := dropEnvFile(t, args)
+				assert.Equal(t, tc.wantCommand, got)
+				assert.Equal(t, "HOME=/tmp\n", envBody)
 				return DockerResult{ExitCode: 0}
 			}
 
@@ -371,6 +373,33 @@ func TestExecuteStage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// dropEnvFile removes the --env-file pair and returns the file contents.
+// ExecuteStage deletes the file when it returns, so this has to run inside the docker mock.
+func dropEnvFile(t *testing.T, args []string) ([]string, string) {
+	t.Helper()
+	got := make([]string, 0, len(args))
+	var body string
+	found := false
+	for i := 0; i < len(args); i++ {
+		if args[i] != "--env-file" {
+			got = append(got, args[i])
+			continue
+		}
+		found = true
+		if i+1 >= len(args) {
+			t.Fatal("--env-file is missing its path")
+		}
+		i++
+		data, err := os.ReadFile(args[i])
+		assert.NoError(t, err)
+		body = string(data)
+	}
+	if !found {
+		t.Fatal("docker command has no --env-file")
+	}
+	return got, body
 }
 
 func TestExecuteStageSuccessIsRecordedAfterExit(t *testing.T) {
