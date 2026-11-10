@@ -188,7 +188,7 @@ Each stage can define:
 - `optional_secrets`: Like `secrets`, but a name that is not set is passed as an empty value instead of failing the stage
 - `requires`: List of stages that must have a signed successful audit record before this stage can run
 - `timeout`: Maximum execution time
-- `user`: Container user, passed as `--user`. Default is the host uid and gid
+- `user`: Container user, passed as `--user`. Default is the host uid and gid. That default also sets `HOME=/tmp`, because the host uid has no home in the image. Set `HOME` in `environment` to use another directory. A stage that sets `user` does not get this default
 - `pids_limit`: Process limit inside the container. Default `4096`
 
 Define an image once under `runners` and use the alias in each stage. A runner that does not match an alias is still used as an image reference.
@@ -407,7 +407,7 @@ Other stage fields:
 - `docker_socket`: bind-mount `/var/run/docker.sock` for this stage. Ignored when the socket is turned off with `GOSONIC_ALLOW_DOCKER_SOCKET=0` or `false`. The socket's group is added so a non-root user can use it. A volume entry that mounts the socket path directly is not covered by this flag.
 - `secrets`: environment variable names. gosonic reads each value from its own environment and drops `GOSONIC_AUDIT_HMAC_KEY` and `GOSONIC_AUDIT_HMAC_KEY_FILE` if they appear here. A name that is not set fails the stage.
 - `optional_secrets`: same as `secrets`, but an unset name is passed as an empty value. Use it for values that a stage can do without.
-- `user`: replaces the default `--user <host-uid>:<host-gid>`. Use `root` only when the image has to.
+- `user`: replaces the default `--user <host-uid>:<host-gid>`. Use `root` only when the image has to. The host-uid default also sets `HOME=/tmp` unless the stage sets `HOME`. A named user does not.
 - `pids_limit`: replaces the default pid limit of 4096.
 - `services`: start named containers on a private network before the stage and remove them afterward. Each service has `image`, `environment`, and `ports`. The stage reaches a service by its name. A port such as `5432:5432` is published on `127.0.0.1`. A spec that already names an address, such as `0.0.0.0:5432:5432`, is left as written.
 - `matrix`: list of dimension names declared under the top-level `matrix` map. Gosonic runs the Cartesian product. Each cell is a stage instance, and each dimension value is exported as an environment variable of that name. `--matrix key=a,b` overrides a dimension for that invocation.
@@ -1002,6 +1002,7 @@ Details of the key and the signed fields are in [Signatures](#signatures). In sh
 Each stage container is started with:
 
 - `--user` set to the host uid and gid, unless the stage sets `user`
+- `HOME=/tmp` when the stage does not set `user` and does not set `HOME`. The host uid has no `/etc/passwd` entry, so Docker would otherwise use `/`, and tools such as pip and npm would try to write there. `/tmp` is writable in the usual base images. A stage that sets `user` keeps the home from the image
 - `--cap-drop ALL`
 - `--security-opt no-new-privileges`
 - `--pids-limit 4096`, unless the stage sets `pids_limit`

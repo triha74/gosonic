@@ -312,7 +312,7 @@ func ExecuteStage(stage StageExecution, auditStore AuditStore, projectName strin
 		gitRev = "unknown" // Don't fail if we can't get git revision
 	}
 
-	envFile, err := writeEnvFile(stage.Environment, stage.Secrets, stage.OptionalSecrets)
+	envFile, err := writeEnvFile(stageEnvironment(stage), stage.Secrets, stage.OptionalSecrets)
 	if err != nil {
 		return err
 	}
@@ -667,6 +667,28 @@ func mountsAuditKey(source, keyPath string) bool {
 		return false
 	}
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+// defaultHome is used when a stage runs as the host uid. That uid has no
+// entry in the image's /etc/passwd, so Docker would set HOME=/ and tools
+// such as pip and npm would try to write there. /tmp is writable in the
+// common base images. A stage that sets user, or sets HOME itself, keeps
+// its own value.
+const defaultHome = "/tmp"
+
+func stageEnvironment(stage StageExecution) map[string]string {
+	if stage.User != "" {
+		return stage.Environment
+	}
+	if _, ok := stage.Environment["HOME"]; ok {
+		return stage.Environment
+	}
+	env := make(map[string]string, len(stage.Environment)+1)
+	for key, value := range stage.Environment {
+		env[key] = value
+	}
+	env["HOME"] = defaultHome
+	return env
 }
 
 func writeEnvFile(env map[string]string, secrets, optionalSecrets []string) (string, error) {
